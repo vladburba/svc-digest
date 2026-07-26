@@ -24,7 +24,7 @@ import database
 import telegram
 from collect import collect
 from filter_ai import select
-from render import render_digest, render_failure
+from render import MAX_ITEMS, render_digest, render_failure
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "digest.log"
@@ -116,11 +116,17 @@ def run_send():
             log.info("отправка: pending пуст — послан сигнал «нового нет»")
             return 0
 
-        text = render_digest(pending, funnel)
+        # Показываем не больше MAX_ITEMS (читаемость + лимит Telegram).
+        # Метим sent ТОЛЬКО показанное — остаток остаётся pending и придёт
+        # в следующий дайджест (outbox: не показал → не потерял).
+        batch = pending[:MAX_ITEMS]
+        overflow = len(pending) - len(batch)
+
+        text = render_digest(batch, funnel, overflow)
         message_id = telegram.send_message(text)
-        marked = database.mark_sent([p["key"] for p in pending], message_id)
-        log.info("отправка: %s записей → message_id=%s · помечено sent %s",
-                 len(pending), message_id, marked)
+        marked = database.mark_sent([p["key"] for p in batch], message_id)
+        log.info("отправка: показано %s (в очереди осталось %s) → message_id=%s · помечено sent %s",
+                 len(batch), overflow, message_id, marked)
         return 0
 
     except Exception as exc:

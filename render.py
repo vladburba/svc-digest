@@ -41,23 +41,22 @@ def render_funnel(funnel):
             f"→ ✅ в дайджест {sel}, ❌ ИИ отсеял {rej}</i>")
 
 
-def render_digest(items, funnel=None):
-    """Собирает HTML-текст дайджеста из готовых записей.
+def render_digest(items, funnel=None, overflow=0):
+    """Собирает HTML-текст дайджеста из ГОТОВОГО к показу набора.
 
-    Пустой список — валидный вход: получается heartbeat «нового нет».
-    funnel (опц.) — воронка за сутки, уходит в футер как доказательство работы.
+    items — ровно то, что показываем (нарезку до MAX_ITEMS делает отправитель,
+      он же метит sent только показанное — «лишнее» остаётся в pending).
+    overflow — сколько ещё в очереди (придут в следующем дайджесте).
+    funnel — воронка за сутки в футер. Пустой items → heartbeat «нового нет».
     """
     head = f"📰 <b>Дайджест · {human_date()}</b>"
     tail = render_funnel(funnel)
 
-    shown = items[:MAX_ITEMS]
-    dropped = max(0, len(items) - MAX_ITEMS)
-
-    if not shown:
+    if not items:
         return head + "\n\nЗа последние сутки нового по твоим интересам не нашлось." + tail
 
     blocks = []
-    for i, item in enumerate(shown, 1):
+    for i, item in enumerate(items, 1):
         # key = guid (чистый); link тащит UTM-хвосты ленты
         key = str(item.get("key") or "")
         url = key if key.startswith("http") else item.get("link", "")
@@ -66,8 +65,8 @@ def render_digest(items, funnel=None):
             f"{esc(item.get('ai_summary', ''))}\n"
             f"<a href=\"{esc(url)}\">читать</a>"
         )
-    if dropped:
-        blocks.append(f"\n<i>…и ещё {dropped} — покажу в следующий раз</i>")
+    if overflow > 0:
+        blocks.append(f"\n<i>…ещё {overflow} в очереди — придут в следующем дайджесте</i>")
 
     text = head + "\n" + "\n".join(blocks) + tail
     if len(text) > MAX_LEN:

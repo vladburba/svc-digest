@@ -17,6 +17,7 @@
 
 import logging
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -25,6 +26,8 @@ import telegram
 from collect import collect
 from filter_ai import select
 from render import MAX_ITEMS, render_digest, render_failure
+
+MAX_MESSAGES = 5  # потолок сообщений за один заход отправителя (страховка)
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "digest.log"
@@ -116,17 +119,34 @@ def run_send():
             log.info("отправка: pending пуст — послан сигнал «нового нет»")
             return 0
 
-        # Показываем не больше MAX_ITEMS (читаемость + лимит Telegram).
-        # Метим sent ТОЛЬКО показанное — остаток остаётся pending и придёт
-        # в следующий дайджест (outbox: не показал → не потерял).
-        batch = pending[:MAX_ITEMS]
-        overflow = len(pending) - len(batch)
+        # Много новостей → несколько сообщений по MAX_ITEMS. Потолок MAX_MESSAGES
+        # за один заход (страховка от аномального навала); остаток сверх него
+        # остаётся pending и придёт в следующий раз.
+        chunks = [pending[i:i + MAX_ITEMS] for i in range(0, len(pending), MAX_ITEMS)]
+        chunks = chunks[:MAX_MESSAGES]
+        overflow = len(pending) - sum(len(c) for c in chunks)
+        parts = len(chunks)
 
-        text = render_digest(batch, funnel, overflow)
-        message_id = telegram.send_message(text)
-        marked = database.mark_sent([p["key"] for p in batch], message_id)
-        log.info("отправка: показано %s (в очереди осталось %s) → message_id=%s · помечено sent %s",
-                 len(batch), overflow, message_id, marked)
+        # Каждый кусок метится sent ПОСЛЕ своей отправки: упади 2-е сообщение —
+        # 1-е уже доставлено и помечено, остальное останется pending (retry).
+        sent_total = 0
+        for idx, chunk in enumerate(chunks, 1):
+            is_last = idx == parts
+            text = render_digest(
+                chunk,
+                funnel=funnel if is_last else None,        # сводка — в последнем
+                overflow=overflow if is_last else 0,
+                part=idx, parts=parts,
+                start_num=(idx - 1) * MAX_ITEMS + 1,
+            )
+            message_id = telegram.send_message(text)
+            database.mark_sent([c["key"] for c in chunk], message_id)
+            sent_total += len(chunk)
+            if not is_last:
+                time.sleep(1)  # вежливо к Telegram между сообщениями в одну беседу
+
+        log.info("отправка: %s новостей в %s сообщ. (в очереди осталось %s)",
+                 sent_total, parts, overflow)
         return 0
 
     except Exception as exc:

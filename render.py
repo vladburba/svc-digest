@@ -41,22 +41,27 @@ def render_funnel(funnel):
             f"→ ✅ в дайджест {sel}, ❌ ИИ отсеял {rej}</i>")
 
 
-def render_digest(items, funnel=None, overflow=0):
-    """Собирает HTML-текст дайджеста из ГОТОВОГО к показу набора.
+def render_digest(items, funnel=None, overflow=0, part=1, parts=1, start_num=1):
+    """Собирает HTML-текст ОДНОГО сообщения дайджеста.
 
-    items — ровно то, что показываем (нарезку до MAX_ITEMS делает отправитель,
-      он же метит sent только показанное — «лишнее» остаётся в pending).
-    overflow — сколько ещё в очереди (придут в следующем дайджесте).
-    funnel — воронка за сутки в футер. Пустой items → heartbeat «нового нет».
+    Когда новостей много, отправитель бьёт их на несколько сообщений и зовёт
+    рендер на каждый кусок:
+      items    — записи этого сообщения (нарезку делает отправитель);
+      part/parts — номер и всего сообщений («(2/3)» в шапке, если parts>1);
+      start_num  — с какого номера нумеровать (сквозная нумерация через части);
+      overflow — остаток сверх потолка сообщений (придёт в следующий раз);
+      funnel   — воронка; кладём в ПОСЛЕДНЕЕ сообщение как сводку.
+    Пустой items → heartbeat «нового нет».
     """
-    head = f"📰 <b>Дайджест · {human_date()}</b>"
+    suffix = f"  <i>({part}/{parts})</i>" if parts > 1 else ""
+    head = f"📰 <b>Дайджест · {human_date()}</b>{suffix}"
     tail = render_funnel(funnel)
 
     if not items:
         return head + "\n\nЗа последние сутки нового по твоим интересам не нашлось." + tail
 
     blocks = []
-    for i, item in enumerate(items, 1):
+    for i, item in enumerate(items, start_num):
         # key = guid (чистый); link тащит UTM-хвосты ленты
         key = str(item.get("key") or "")
         url = key if key.startswith("http") else item.get("link", "")

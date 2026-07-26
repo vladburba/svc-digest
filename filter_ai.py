@@ -21,6 +21,7 @@ import httpx
 from dotenv import load_dotenv
 
 from collect import collect
+from netcfg import EGRESS_PROXY
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -88,6 +89,7 @@ def ask_model(model, system_prompt, user_prompt, api_key):
             ],
             "temperature": 0.2,
         },
+        proxy=EGRESS_PROXY,
         timeout=TIMEOUT,
     )
     response.raise_for_status()

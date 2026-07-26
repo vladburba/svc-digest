@@ -50,6 +50,11 @@ def run_collect():
     items, cs = collect()
     log.info("сбор: HTTP %s | в ленте %s | свежих за %sч %s",
              cs["http"], cs["total"], cs["window_hours"], cs["fresh"])
+    if cs.get("error"):
+        # Сеть/лента недоступна — молча, ретрай через час подберёт.
+        log.warning("сбор не удался (%s) — базу не трогаем, подберём в следующий заход",
+                    cs["error"])
+        return 1
 
     unseen, skipped = database.filter_unseen(items)
     log.info("дедуп: было %s | уже в базе %s | новых %s",

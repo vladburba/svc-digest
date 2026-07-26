@@ -16,6 +16,8 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
+from netcfg import EGRESS_PROXY
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 API_BASE = "https://api.telegram.org"
@@ -23,9 +25,8 @@ TIMEOUT = 30.0
 
 
 def _client():
-    """Прокси задаётся ЯВНО через .env — окружение контейнер не наследует."""
-    proxy = (os.getenv("TELEGRAM_PROXY") or "").strip()
-    return httpx.Client(proxy=proxy or None, timeout=TIMEOUT)
+    """Единый egress-прокси из netcfg (пусто на маке → напрямую)."""
+    return httpx.Client(proxy=EGRESS_PROXY, timeout=TIMEOUT)
 
 
 def send_message(text, parse_mode="HTML", disable_preview=True):

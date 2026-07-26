@@ -14,6 +14,10 @@ services:
       - ./digest.db:/app/digest.db        # база — переживает пересоздание контейнера
       - ./digest.log:/app/digest.log      # лог — доступен с хоста
       - ./interests.md:/app/interests.md  # config-as-code: правка без пересборки
-    # Сеть уточняется факт-чеком egress с vlad-main:
-    #   direct работает  → оставляем bridge (по умолчанию), TELEGRAM_PROXY пусто
-    #   Telegram блокнут  → network_mode: host + TELEGRAM_PROXY=socks5://127.0.0.1:1080
+    # Сеть хоста напрямую (как у vladburba-bot). Причина: из bridge-NAT
+    # контейнер НЕ достаёт до habr.com (РФ IP) — SYN не доходит, хотя
+    # telegram/openrouter из bridge работают, а хост habr берёт за 1.6с.
+    # Policy-routing ни при чём (ip rule стандартный, маршрут до habr и
+    # telegram одинаковый) — это квирк NAT/netns. host-стек = ведёт себя
+    # как хост → habr доступен. TELEGRAM_PROXY пуст: хост достаёт всё напрямую.
+    network_mode: host

@@ -3,3 +3,8 @@ __pycache__/
 .env
 *.db
 *.log
+
+# Локальные разрешения Claude Code — машинозависимы, в репозиторий не нужны.
+# Общие настройки проекта (.claude/settings.json), если появятся, отслеживаем.
+.claude/settings.local.json
+.claude/*.tmp.*

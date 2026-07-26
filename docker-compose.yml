@@ -1,7 +1,7 @@
 # svc-digest — отдельный compose (свой blast radius, как у сайта на 6.02).
 # Не сервис-демон, а батч: контейнер поднимается на один прогон и умирает.
 #   docker compose run --rm digest collect   # сборщик, по cron ~раз в час
-#   docker compose run --rm digest send      # отправитель, по cron в 09:00
+#   docker compose run --rm digest send      # отправитель, по cron в 08:30
 
 services:
   digest:

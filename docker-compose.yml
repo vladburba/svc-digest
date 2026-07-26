@@ -1,0 +1,19 @@
+# svc-digest — отдельный compose (свой blast radius, как у сайта на 6.02).
+# Не сервис-демон, а батч: контейнер поднимается на один прогон и умирает.
+#   docker compose run --rm digest collect   # сборщик, по cron ~раз в час
+#   docker compose run --rm digest send      # отправитель, по cron в 09:00
+
+services:
+  digest:
+    build: .
+    image: svc-digest:latest
+    env_file: .env
+    volumes:
+      # ВАЖНО: эти файлы обязаны существовать ДО первого run, иначе Docker
+      # создаст их директориями (грабля с 5.12). На сервере — touch перед стартом.
+      - ./digest.db:/app/digest.db        # база — переживает пересоздание контейнера
+      - ./digest.log:/app/digest.log      # лог — доступен с хоста
+      - ./interests.md:/app/interests.md  # config-as-code: правка без пересборки
+    # Сеть уточняется факт-чеком egress с vlad-main:
+    #   direct работает  → оставляем bridge (по умолчанию), TELEGRAM_PROXY пусто
+    #   Telegram блокнут  → network_mode: host + TELEGRAM_PROXY=socks5://127.0.0.1:1080

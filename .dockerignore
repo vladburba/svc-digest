@@ -1,0 +1,10 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.env
+*.db
+*.log
+bench_models.py
+СХЕМА.md
+README.md

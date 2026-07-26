@@ -44,22 +44,34 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def run_collect():
-    """СБОРЩИК: пополняет базу. Человека не трогает — только лог."""
+    """СБОРЩИК: пополняет базу. Человека не трогает — только лог.
+
+    Каждый заход пишет свою воронку в collect_runs — отправитель соберёт из
+    них статистику за сутки и вложит в сообщение (сам сбора не видит).
+    """
     database.init_db()
+    funnel = {"total_in_feed": None, "in_window": None, "already_seen": None,
+              "new_items": 0, "selected": 0, "rejected": 0, "error": None}
 
     items, cs = collect()
+    funnel["total_in_feed"] = cs["total"]
+    funnel["in_window"] = cs["fresh"]
     log.info("сбор: HTTP %s | в ленте %s | свежих за %sч %s",
              cs["http"], cs["total"], cs["window_hours"], cs["fresh"])
     if cs.get("error"):
-        # Сеть/лента недоступна — молча, ретрай через час подберёт.
+        funnel["error"] = cs["error"]
+        database.record_run(funnel)
         log.warning("сбор не удался (%s) — базу не трогаем, подберём в следующий заход",
                     cs["error"])
         return 1
 
     unseen, skipped = database.filter_unseen(items)
+    funnel["already_seen"] = skipped
+    funnel["new_items"] = len(unseen)
     log.info("дедуп: было %s | уже в базе %s | новых %s",
              len(items), skipped, len(unseen))
     if not unseen:
+        database.record_run(funnel)
         log.info("новых нет — базу не трогаем")
         return 0
 
@@ -67,18 +79,20 @@ def run_collect():
     for failure in ai["failed"]:
         log.warning("фолбэк: %s", failure)
     if ai["error"]:
-        # Молча: ретрай через час подберёт. Человека не будим.
+        funnel["error"] = ai["error"]
+        database.record_run(funnel)
         log.warning("ИИ недоступен (%s) — новых не пишем, подберём в следующий заход",
                     ai["error"])
         return 1
 
     picked = {item["key"] for item in selected}
     rejected = [item for item in unseen if item["key"] not in picked]
-    n_pending = database.record(selected, "pending")
-    n_rejected = database.record(rejected, "rejected")
+    funnel["selected"] = database.record(selected, "pending")
+    funnel["rejected"] = database.record(rejected, "rejected")
+    database.record_run(funnel)
 
     log.info("отбор: %s новых → pending %s · rejected %s · модель %s",
-             len(unseen), n_pending, n_rejected, ai["model"])
+             len(unseen), funnel["selected"], funnel["rejected"], ai["model"])
     st = database.stats()
     log.info("база: pending %s · sent %s · rejected %s",
              st["pending"] or 0, st["sent"] or 0, st["rejected"] or 0)
@@ -91,13 +105,18 @@ def run_send():
     try:
         pending = database.get_pending()
 
+        # Воронка за сутки для футера сообщения: агрегат заходов сборщика
+        # с прошлой отправки (или за всё время, если отправки ещё не было).
+        since = database.last_sent_at() or "1970-01-01T00:00:00+00:00"
+        funnel = database.funnel_since(since)
+
         if not pending:
             # Heartbeat: молчание неотличимо от «контейнер не стартовал».
-            telegram.send_message(render_digest([]))
+            telegram.send_message(render_digest([], funnel))
             log.info("отправка: pending пуст — послан сигнал «нового нет»")
             return 0
 
-        text = render_digest(pending)
+        text = render_digest(pending, funnel)
         message_id = telegram.send_message(text)
         marked = database.mark_sent([p["key"] for p in pending], message_id)
         log.info("отправка: %s записей → message_id=%s · помечено sent %s",

@@ -27,18 +27,34 @@ def human_date(moment=None):
     return f"{moment.day} {MONTHS[moment.month - 1]}"
 
 
-def render_digest(items):
+def render_funnel(funnel):
+    """Строка воронки для футера: сколько собрано → отобрано → отсеяно."""
+    if not funnel:
+        return ""
+    new = funnel.get("new_items", 0)
+    sel = funnel.get("selected", 0)
+    rej = funnel.get("rejected", 0)
+    feed = funnel.get("last_feed")
+    window = funnel.get("last_window")
+    lens = f"лента {feed} → в окне 48ч {window} · " if feed is not None else ""
+    return (f"\n\n<i>📊 За сутки: {lens}новых {new} "
+            f"→ ✅ в дайджест {sel}, ❌ ИИ отсеял {rej}</i>")
+
+
+def render_digest(items, funnel=None):
     """Собирает HTML-текст дайджеста из готовых записей.
 
     Пустой список — валидный вход: получается heartbeat «нового нет».
+    funnel (опц.) — воронка за сутки, уходит в футер как доказательство работы.
     """
     head = f"📰 <b>Дайджест · {human_date()}</b>"
+    tail = render_funnel(funnel)
 
     shown = items[:MAX_ITEMS]
     dropped = max(0, len(items) - MAX_ITEMS)
 
     if not shown:
-        return head + "\n\nЗа последние сутки нового по твоим интересам не нашлось."
+        return head + "\n\nЗа последние сутки нового по твоим интересам не нашлось." + tail
 
     blocks = []
     for i, item in enumerate(shown, 1):
@@ -53,9 +69,7 @@ def render_digest(items):
     if dropped:
         blocks.append(f"\n<i>…и ещё {dropped} — покажу в следующий раз</i>")
 
-    footer = f"\n\n<i>{len(shown)} материалов за последние сутки</i>"
-
-    text = head + "\n" + "\n".join(blocks) + footer
+    text = head + "\n" + "\n".join(blocks) + tail
     if len(text) > MAX_LEN:
         text = text[:MAX_LEN - 20].rsplit("\n", 1)[0] + "\n<i>…обрезано</i>"
     return text

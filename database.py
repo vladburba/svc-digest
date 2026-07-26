@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS news (
     message_id    INTEGER                 -- расписка Telegram
 );
 CREATE INDEX IF NOT EXISTS idx_news_status ON news(status);
+
+-- Журнал заходов сборщика: воронка каждого прогона. Нужен, чтобы отправитель
+-- в 09:00 собрал полную статистику за сутки и вложил её в сообщение
+-- (сам отправитель сбора не видит — работы развязаны).
+CREATE TABLE IF NOT EXISTS collect_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at        TEXT NOT NULL,       -- ISO 8601 с зоной
+    total_in_feed INTEGER,             -- сколько записей в ленте
+    in_window     INTEGER,             -- из них попали в окно 48ч
+    already_seen  INTEGER,             -- дедуп отсеял (старые, уже в базе)
+    new_items     INTEGER,             -- новых пошло в ИИ
+    selected      INTEGER,             -- ИИ отобрал
+    rejected      INTEGER,             -- ИИ забраковал
+    error         TEXT                 -- текст ошибки, если заход упал
+);
 """
 
 
@@ -116,6 +131,53 @@ def mark_sent(keys, message_id):
             [stamp, message_id, *keys],
         )
         return cursor.rowcount
+
+
+def record_run(funnel):
+    """Пишет воронку одного захода сборщика в журнал collect_runs."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO collect_runs "
+            "(ran_at, total_in_feed, in_window, already_seen, new_items, selected, rejected, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_iso(), funnel.get("total_in_feed"), funnel.get("in_window"),
+             funnel.get("already_seen"), funnel.get("new_items"),
+             funnel.get("selected"), funnel.get("rejected"), funnel.get("error")),
+        )
+
+
+def funnel_since(since_iso):
+    """Суммарная воронка заходов сборщика ПОСЛЕ момента since_iso.
+
+    Аргрегат за период между отправками: новых/отобрано/отсеяно — суммы;
+    лента/окно — снимок ПОСЛЕДНЕГО захода (складывать 40×24 бессмысленно).
+    """
+    with connect() as conn:
+        agg = conn.execute(
+            "SELECT COUNT(*) runs, "
+            "COALESCE(SUM(new_items),0) new_items, "
+            "COALESCE(SUM(selected),0) selected, "
+            "COALESCE(SUM(rejected),0) rejected "
+            "FROM collect_runs WHERE ran_at > ? AND error IS NULL",
+            (since_iso,),
+        ).fetchone()
+        last = conn.execute(
+            "SELECT total_in_feed, in_window, already_seen FROM collect_runs "
+            "WHERE ran_at > ? AND error IS NULL ORDER BY ran_at DESC LIMIT 1",
+            (since_iso,),
+        ).fetchone()
+    out = dict(agg)
+    out["last_feed"] = last["total_in_feed"] if last else None
+    out["last_window"] = last["in_window"] if last else None
+    out["last_seen"] = last["already_seen"] if last else None
+    return out
+
+
+def last_sent_at():
+    """Момент прошлой отправки (для окна агрегации воронки). None если не было."""
+    with connect() as conn:
+        row = conn.execute("SELECT MAX(sent_at) AS ts FROM news WHERE status='sent'").fetchone()
+    return row["ts"]
 
 
 def stats():

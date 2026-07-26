@@ -9,7 +9,9 @@ Telegram понимает узкий набор тегов: b, i, u, s, a, code,
 """
 
 import html
-from datetime import datetime
+
+from clock import now_local
+from collect import WINDOW_HOURS
 
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
           "июля", "августа", "сентября", "октября", "ноября", "декабря")
@@ -23,7 +25,9 @@ def esc(text):
 
 
 def human_date(moment=None):
-    moment = moment or datetime.now().astimezone()
+    # Дата шапки — по MSK, а не по зоне контейнера: иначе дайджест, ушедший
+    # после полуночи по Москве, был бы подписан вчерашним числом.
+    moment = moment or now_local()
     return f"{moment.day} {MONTHS[moment.month - 1]}"
 
 
@@ -36,7 +40,7 @@ def render_funnel(funnel):
     rej = funnel.get("rejected", 0)
     feed = funnel.get("last_feed")
     window = funnel.get("last_window")
-    lens = f"лента {feed} → в окне 48ч {window} · " if feed is not None else ""
+    lens = f"лента {feed} → в окне {WINDOW_HOURS}ч {window} · " if feed is not None else ""
     return (f"\n\n<i>📊 За сутки: {lens}новых {new} "
             f"→ ✅ в дайджест {sel}, ❌ ИИ отсеял {rej}</i>")
 

@@ -14,6 +14,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from clock import human
+
 DB_PATH = Path(__file__).resolve().parent / "digest.db"
 
 SCHEMA = """
@@ -49,8 +51,15 @@ CREATE TABLE IF NOT EXISTS collect_runs (
 
 
 def now_iso():
-    """Локальное время с явной зоной — без ловушки «UTC без зоны»."""
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    """Метка для базы — СТРОГО UTC, всегда с хвостом +00:00.
+
+    Не местное время: SQL сравнивает эти метки как СТРОКИ (MAX(sent_at),
+    WHERE ran_at > ?). Смешаешь зоны — «02:00+03:00» станет лексикографически
+    больше «01:00+00:00», хотя случилось на два часа раньше, и воронка в
+    футере дайджеста посчитает не тот период. Человеку время показываем в
+    MSK — этим занимается clock.py, а хранение остаётся однородным.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 def connect():
@@ -199,4 +208,4 @@ if __name__ == "__main__":
     print(f"база: {DB_PATH}")
     print(f"всего {s['total']} | pending {s['pending'] or 0} | "
           f"sent {s['sent'] or 0} | rejected {s['rejected'] or 0} | "
-          f"последняя отправка: {s['last_sent'] or '—'}")
+          f"последняя отправка: {human(s['last_sent']) or '—'}")

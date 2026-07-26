@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import feedparser
 import httpx
 
+from clock import to_local
 from netcfg import EGRESS_PROXY
 
 FEED_URL = "https://habr.com/ru/rss/hubs/artificial_intelligence/articles/?fl=ru"
@@ -110,7 +111,8 @@ def main():
     print("-" * 70)
 
     for i, item in enumerate(items, 1):
-        when = item["published"].astimezone().strftime("%Y-%m-%d %H:%M") if item["published"] else "—"
+        local = to_local(item["published"])
+        when = local.strftime("%Y-%m-%d %H:%M %Z") if local else "—"
         print(f"\n{i}. {item['title']}")
         print(f"   {when}  |  ключ: {item['key']}")
         print(f"   {item['summary'][:200]}...")

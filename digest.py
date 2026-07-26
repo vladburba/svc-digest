@@ -23,6 +23,7 @@ from pathlib import Path
 
 import database
 import telegram
+from clock import LocalFormatter
 from collect import collect
 from filter_ai import select
 from render import MAX_ITEMS, render_digest, render_failure
@@ -32,12 +33,16 @@ MAX_MESSAGES = 5  # потолок сообщений за один заход �
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "digest.log"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
-              logging.StreamHandler(sys.stdout)],
-)
+# Формат времени — местный (MSK) и с явной зоной: иначе в digest.log было
+# время контейнера (UTC), а в syslog хоста — MSK, и одно событие выглядело
+# как два разных момента.
+_formatter = LocalFormatter("%(asctime)s %(levelname)-7s %(message)s")
+_handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8"),
+             logging.StreamHandler(sys.stdout)]
+for _handler in _handlers:
+    _handler.setFormatter(_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=_handlers)
 log = logging.getLogger("digest")
 
 # КРИТИЧНО: httpx на INFO пишет полный URL, а у Telegram Bot API токен лежит

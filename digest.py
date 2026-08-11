@@ -31,7 +31,9 @@ import time
 import traceback
 from pathlib import Path
 
+import clock
 import database
+import render
 import telegram
 from clock import LocalFormatter
 from collect import WINDOW_HOURS, collect
@@ -188,9 +190,15 @@ def run_send(quiet_if_empty=False):
     try:
         pending = database.get_pending()
 
-        # Воронка для футера: агрегат работ с прошлой отправки (или за всё
-        # время, если отправки ещё не было).
-        since = database.last_sent_at() or "1970-01-01T00:00:00+00:00"
+        # Период футера зависит от того, какой это выпуск, и это не украшение,
+        # а смысл: отбор в 20:00 — последний за сутки, после него цифры дня
+        # уже не изменятся. Поэтому вечерний дайджест подводит ИТОГ ЗА СУТКИ
+        # (с 00:00 MSK), а утренний отчитывается за ночь — с прошлого выпуска.
+        evening = not render.is_morning()
+        if evening:
+            since = clock.day_start_iso()
+        else:
+            since = database.last_sent_at() or "1970-01-01T00:00:00+00:00"
         funnel = database.funnel_since(since)
         filter_funnel = database.filter_funnel_since(since)
         waiting = database.count_new()
@@ -201,7 +209,7 @@ def run_send(quiet_if_empty=False):
                 return 0
             # Heartbeat: молчание неотличимо от «контейнер не стартовал».
             telegram.send_message(render_digest([], funnel, filter_funnel=filter_funnel,
-                                                waiting=waiting, since=since))
+                                                waiting=waiting))
             log.info("отправка: pending пуст — послан сигнал «нового нет»")
             return 0
 
@@ -210,7 +218,8 @@ def run_send(quiet_if_empty=False):
         # остаётся pending и придёт в следующий раз.
         chunks = [pending[i:i + MAX_ITEMS] for i in range(0, len(pending), MAX_ITEMS)]
         chunks = chunks[:MAX_MESSAGES]
-        overflow = len(pending) - sum(len(c) for c in chunks)
+        going = sum(len(c) for c in chunks)          # сколько уедет этой отправкой
+        overflow = len(pending) - going              # сколько останется ждать
         parts = len(chunks)
 
         # Каждый кусок метится sent ПОСЛЕ своей отправки: упади 2-е сообщение —
@@ -223,8 +232,8 @@ def run_send(quiet_if_empty=False):
                 funnel=funnel if is_last else None,        # сводка — в последнем
                 filter_funnel=filter_funnel if is_last else None,
                 waiting=waiting if is_last else 0,
-                since=since,
                 overflow=overflow if is_last else 0,
+                total=going if is_last else 0,
                 part=idx, parts=parts,
                 start_num=(idx - 1) * MAX_ITEMS + 1,
             )

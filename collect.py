@@ -17,6 +17,7 @@ import feedparser
 import httpx
 
 from clock import to_local
+from dedup import dedup_key
 from netcfg import EGRESS_PROXY
 
 FEED_URL = "https://habr.com/ru/rss/hubs/artificial_intelligence/articles/?fl=ru"
@@ -38,7 +39,11 @@ def strip_html(raw):
 
 
 def entry_key(entry):
-    """Ключ дедупликации: guid, если лента его даёт; иначе — link."""
+    """Естественный ключ записи: guid, если лента его даёт; иначе — link.
+
+    Остаётся первичным ключом в базе (по нему видно, каким именно адресом
+    статья к нам пришла), но дедуп идёт НЕ по нему — см. dedup.dedup_key.
+    """
     return entry.get("id") or entry.get("link", "")
 
 
@@ -87,9 +92,11 @@ def collect(feed_url=FEED_URL, window_hours=WINDOW_HOURS):
         # протащит весь архив на первом запуске (у Habr дата есть всегда).
         if published and published < cutoff:
             continue
+        key = entry_key(entry)
         fresh.append(
             {
-                "key": entry_key(entry),
+                "key": key,
+                "dedup_key": dedup_key(key, entry.get("link", "")),
                 "title": entry.get("title", "").strip(),
                 "link": entry.get("link", ""),
                 "published": published,

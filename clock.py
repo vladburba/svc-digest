@@ -18,7 +18,7 @@ UTC (database.now_iso), а человеку показываем MSK — лог�
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # Прибито гвоздями намеренно: сервис личный, один часовой пояс — Владов.
@@ -42,6 +42,18 @@ def human(moment_iso):
     if not moment_iso:
         return None
     return to_local(datetime.fromisoformat(moment_iso)).strftime(HUMAN_FMT)
+
+
+def day_start_iso():
+    """Начало текущих МОСКОВСКИХ суток, но в UTC — для сравнения с базой.
+
+    Нужно вечернему дайджесту: он подводит итог за сутки, а сутки у человека
+    календарные и московские. В базе же метки в UTC, поэтому 00:00 MSK надо
+    отдать как «21:00 предыдущего дня UTC» — иначе сравнение строк в SQL
+    отрежет не тот кусок.
+    """
+    midnight_msk = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_msk.astimezone(timezone.utc).isoformat()
 
 
 class LocalFormatter(logging.Formatter):

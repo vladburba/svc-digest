@@ -32,47 +32,74 @@ def human_date(moment=None):
     return f"{moment.day} {MONTHS[moment.month - 1]}"
 
 
-def period_hours(since_iso):
-    """Сколько часов прошло с прошлой отправки. None — если её не было.
+def plural(n, one, few, many):
+    """Русское согласование: 1 новость, 2 новости, 5 новостей.
 
-    Нужно, чтобы футер не врал: раньше там стояло «за сутки», а период на
-    самом деле считался с прошлой отправки. Пропустили одну (лежал Telegram) —
-    и «сутки» молча превращались в двое.
+    Без этого футер читается как машинный отчёт («1 новостей»), а он должен
+    читаться как фраза — иначе глаз спотыкается и цифры не усваиваются.
     """
-    if not since_iso or since_iso.startswith("1970"):
-        return None
-    delta = now_local() - to_local(datetime.fromisoformat(since_iso))
-    return max(1, round(delta.total_seconds() / 3600))
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 def render_filter_line(filter_funnel, waiting):
-    """Строка про заходы фильтра: когда отработал, чем кончилось, чего стоил.
+    """Строка про заходы фильтра: во сколько работал и сколько запросов стоил.
 
     Главное здесь — видимость провала. Раньше неудачные заходы ИИ просто
     выпадали из статистики, и человек не мог отличить «сегодня новостей нет»
-    от «отбор не состоялся». Теперь провал подписан и сказано, сколько ждёт.
+    от «отбор не состоялся». Теперь у каждого захода своё время и свой итог.
     """
     if not filter_funnel:
         return ""
     runs = filter_funnel.get("runs_list") or []
     if not runs:
-        return "\n<i>🤖 Фильтрация: не запускалась</i>"
+        return "\n<i>🤖 Отбор ИИ ещё не запускался</i>"
 
-    marks = []
+    parts = []
     for run in runs:
         when = to_local(datetime.fromisoformat(run["ran_at"])).strftime("%H:%M")
-        marks.append(f"{when} ✗" if run["error"] else f"{when} ✓")
-    attempts = filter_funnel.get("attempts", 0)
-    cost = f" · {attempts} запр. к ИИ" if attempts else ""
-    line = f"\n<i>🤖 Фильтрация: {' · '.join(marks)}{cost}</i>"
+        if run["error"]:
+            parts.append(f"в {when} — ИИ не ответил")
+        else:
+            n = run["attempts"] or 0
+            parts.append(f"в {when} — {n} {plural(n, 'запрос', 'запроса', 'запросов')}")
+    line = f"\n<i>🤖 Отбор ИИ: {', '.join(parts)}</i>"
 
+    # Итоговую сумму показываем только вечером: отбор в 20:00 последний за
+    # сутки, значит это окончательный расход дня. Утром такая строка была бы
+    # промежуточной и только сбивала бы — впереди ещё одно окно.
+    total = filter_funnel.get("attempts", 0)
+    if not is_morning() and total:
+        line += (f"\n<i>       за сутки {total} "
+                 f"{plural(total, 'запрос', 'запроса', 'запросов')} к ИИ</i>")
     if any(run["error"] for run in runs) and waiting:
-        line += f"\n<i>⏳ ИИ не ответил — {waiting} новостей ждут следующего окна</i>"
+        line += (f"\n<i>⏳ {waiting} {plural(waiting, 'новость ждёт', 'новости ждут', 'новостей ждут')} "
+                 f"следующего отбора</i>")
     return line
 
 
-def render_funnel(funnel, filter_funnel=None, waiting=0, since=None):
-    """Футер: что собрано за период и что с этим сделал ИИ.
+def render_funnel(funnel, filter_funnel=None, waiting=0, total=0, overflow=0):
+    """Футер сообщения — три строки, каждая отвечает на свой вопрос.
+
+    Порядок идёт от близкого к далёкому:
+      📬 что в этой пачке — про сообщение, которое человек читает прямо сейчас;
+      🌙/📊 что случилось с прошлого выпуска — работа сборщика и ИИ;
+      🤖 как отработал отбор — во сколько и какой ценой.
+
+    Средняя строка РАЗНАЯ утром и вечером, и это не косметика. Отбор в 20:00 —
+    последний за сутки, после него цифры дня уже не изменятся: вечерний выпуск
+    подводит ИТОГ («📊 Итог за сутки»), утренний отчитывается за ночь («🌙 За
+    ночь»). Раньше обе подписывались одинаково — «за N часов», — и число
+    прыгало между 12 и 24 в зависимости от того, был ли вечерний выпуск;
+    человек читал его как ошибку, потому что считать в уме было нечего.
+
+    Первая строка появилась тогда же: без неё футер отчитывался за период,
+    список показывал очередь, и «отобрано 16» рядом с десятью новостями
+    выглядело противоречием. Теперь у машины свой счёт, у цеха свой.
 
     Из старой версии убрана строка «лента 40 → в окне 168ч 40»: она печаталась
     неизменной 383 захода подряд (habr всегда отдаёт страницу из 40 записей,
@@ -80,30 +107,51 @@ def render_funnel(funnel, filter_funnel=None, waiting=0, since=None):
     """
     if not funnel:
         return ""
-    hours = period_hours(since)
-    span = f"За {hours}ч" if hours else "За всё время"
+    lines = []
+
+    if total:
+        head = f"📬 В этом дайджесте {total} {plural(total, 'новость', 'новости', 'новостей')}"
+        if overflow:
+            head += (f", ещё {overflow} {plural(overflow, 'ждёт', 'ждут', 'ждут')} "
+                     f"следующего")
+        lines.append(head)
+
     new = funnel.get("new_items", 0)
     sel = (filter_funnel or {}).get("selected", 0)
     rej = (filter_funnel or {}).get("rejected", 0)
+    if is_morning():
+        # Утро — промежуточный отчёт: что накопилось с вечернего выпуска.
+        lines.append(f"🌙 За ночь собрано {new} "
+                     f"{plural(new, 'новость', 'новости', 'новостей')}: "
+                     f"отобрано {sel}, отсеяно {rej}")
+    else:
+        # Вечер — окончательный: отбор в 20:00 последний за сутки, эти цифры
+        # уже не изменятся до полуночи. Потому и «итог», а не «за период».
+        lines.append(f"📊 Итог за сутки: собрано {new}, "
+                     f"отобрано {sel}, отсеяно {rej}")
 
-    text = f"\n\n<i>📊 {span}: новых {new} → ✅ отобрано {sel} · ❌ отсеяно {rej}</i>"
     if funnel.get("failed_runs"):
-        text += f"\n<i>⚠️ Заходов сбора с ошибкой: {funnel['failed_runs']}</i>"
+        n = funnel["failed_runs"]
+        lines.append(f"⚠️ Сбор падал {n} {plural(n, 'раз', 'раза', 'раз')}")
+
+    text = "\n\n" + "\n".join(f"<i>{line}</i>" for line in lines)
     return text + render_filter_line(filter_funnel, waiting)
 
 
+def is_morning():
+    """Утренний это выпуск или вечерний. Час берём местный, а не аргументом:
+    cron и так знает, когда зовёт, а лишний параметр — повод рассинхрона."""
+    return now_local().hour < MORNING_UNTIL
+
+
 def digest_title():
-    """Шапка по времени суток: утренний заход или вечерний.
-
-    Отправок теперь две (08:30 и 20:30), и в ленте чата они должны различаться
-    с одного взгляда. Час берём местный, а не аргументом: cron и так знает,
-    когда зовёт, а лишний параметр — лишний повод рассинхрона.
-    """
-    return "🌅 Утренний" if now_local().hour < MORNING_UNTIL else "🌆 Вечерний"
+    """Шапка по времени суток. Отправок две (08:30 и 20:30), и в ленте чата
+    они должны различаться с одного взгляда."""
+    return "🌅 Утренний" if is_morning() else "🌆 Вечерний"
 
 
-def render_digest(items, funnel=None, filter_funnel=None, waiting=0, since=None,
-                  overflow=0, part=1, parts=1, start_num=1):
+def render_digest(items, funnel=None, filter_funnel=None, waiting=0,
+                  overflow=0, part=1, parts=1, start_num=1, total=0):
     """Собирает HTML-текст ОДНОГО сообщения дайджеста.
 
     Когда новостей много, отправитель бьёт их на несколько сообщений и зовёт
@@ -120,7 +168,7 @@ def render_digest(items, funnel=None, filter_funnel=None, waiting=0, since=None,
     """
     suffix = f"  <i>({part}/{parts})</i>" if parts > 1 else ""
     head = f"📰 <b>{digest_title()} дайджест · {human_date()}</b>{suffix}"
-    tail = render_funnel(funnel, filter_funnel, waiting, since)
+    tail = render_funnel(funnel, filter_funnel, waiting, total, overflow)
 
     if not items:
         return head + "\n\nНового по твоим интересам не нашлось." + tail
@@ -135,9 +183,8 @@ def render_digest(items, funnel=None, filter_funnel=None, waiting=0, since=None,
             f"{esc(item.get('ai_summary', ''))}\n"
             f"<a href=\"{esc(url)}\">читать</a>"
         )
-    if overflow > 0:
-        blocks.append(f"\n<i>…ещё {overflow} в очереди — придут в следующем дайджесте</i>")
-
+    # Про остаток очереди больше не пишем здесь: он ушёл в первую строку футера
+    # («в этом дайджесте 10, ещё 6 ждут следующего») — одно место вместо двух.
     text = head + "\n" + "\n".join(blocks) + tail
     if len(text) > MAX_LEN:
         text = text[:MAX_LEN - 20].rsplit("\n", 1)[0] + "\n<i>…обрезано</i>"

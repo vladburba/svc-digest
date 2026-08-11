@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Код. interests.md кладём как дефолт, но на сервере он bind-mount'ится
 # (config-as-code: правим отбор без пересборки образа).
-COPY clock.py netcfg.py collect.py filter_ai.py database.py render.py telegram.py digest.py interests.md ./
+COPY clock.py netcfg.py dedup.py collect.py filter_ai.py database.py render.py telegram.py digest.py interests.md ./
 
 # Секреты (.env) и данные (digest.db) в образ НЕ попадают — приходят
 # через env_file и bind-mount в момент запуска.

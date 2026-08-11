@@ -94,6 +94,7 @@ ssh admin@vlad-main 'tail -5 /opt/apps/svc-digest/digest.log'
 |---|---|
 | `digest.py` | точка входа, три команды: `collect`, `filter`, `send` |
 | `collect.py` | тянет RSS (feedparser), окно 168 часов |
+| `dedup.py` | ключ «та же статья» — по номеру статьи, а не по адресу |
 | `filter_ai.py` | отбор через OpenRouter, цепочка моделей с фолбэком |
 | `database.py` | SQLite: `news` (new/pending/sent/rejected/expired), `collect_runs`, `filter_runs` |
 | `render.py` | сборка текста дайджеста, по 5 новостей в сообщении, максимум 2 сообщения за раз |

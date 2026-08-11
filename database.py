@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from clock import human
+from dedup import dedup_key
 
 DB_PATH = Path(__file__).resolve().parent / "digest.db"
 
@@ -27,6 +28,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS news (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     key           TEXT NOT NULL UNIQUE,   -- guid ленты, иначе link
+    dedup_key     TEXT,                   -- «та же статья»: habr.com:1068692
     title         TEXT NOT NULL,
     link          TEXT NOT NULL,
     published     TEXT,                   -- ISO 8601 с зоной
@@ -38,6 +40,11 @@ CREATE TABLE IF NOT EXISTS news (
     message_id    INTEGER                 -- расписка Telegram
 );
 CREATE INDEX IF NOT EXISTS idx_news_status ON news(status);
+-- ВНИМАНИЕ: индекс по dedup_key здесь НЕ создаётся. На боевой базе таблица
+-- news уже существует, CREATE TABLE IF NOT EXISTS её пропускает, и колонку
+-- добавляет только ALTER ниже — а индекс, объявленный тут, упал бы на «no
+-- such column» раньше, чем ALTER успеет отработать. Поэтому он создаётся в
+-- init_db ПОСЛЕ миграции. Поймано на копии прода 2026-08-12.
 
 -- Журнал заходов сборщика: воронка каждого прогона. Нужен, чтобы отправитель
 -- в 08:30 собрал полную статистику за сутки и вложил её в сообщение
@@ -114,20 +121,57 @@ def init_db():
         except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
+        # 2026-08-12: дедуп переехал с адреса статьи на её номер — Habr меняет
+        # URL при переносе между блогами, и статья приходила дважды.
+        try:
+            conn.execute("ALTER TABLE news ADD COLUMN dedup_key TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+        # Доливаем ключи старым записям. Считаем в Python, а не в SQL: правило
+        # нормализации одно на весь проект и живёт в dedup.py — раздваивать его
+        # на SQL-выражение значит гарантированно рассинхронить.
+        stale = conn.execute(
+            "SELECT id, key, link FROM news WHERE dedup_key IS NULL"
+        ).fetchall()
+        if stale:
+            conn.executemany(
+                "UPDATE news SET dedup_key = ? WHERE id = ?",
+                [(dedup_key(row["key"], row["link"]), row["id"]) for row in stale],
+            )
+
+        # Только теперь, когда колонка гарантированно есть. Индекс НЕ уникальный:
+        # в базе лежат четыре пары дублей, приехавших до 2026-08-12, и UNIQUE не
+        # дал бы мигрировать. Уникальность тут и не нужна — дедуп проверяет
+        # наличие ключа сам, до вставки.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_news_dedup ON news(dedup_key)")
+        conn.commit()
 
 
 def filter_unseen(items):
     """Оставляет то, чего в базе ещё НЕТ (любой статус). → (новые, отсеяно).
 
-    Дедуп по всей базе: new + pending + sent + rejected + expired. Если ключ
-    уже есть в любом статусе — запись мы уже видели, второй раз не заводим.
+    Дедуп по всей базе: new + pending + sent + rejected + expired. Если запись
+    уже есть в любом статусе — мы её видели, второй раз не заводим.
+
+    Сравниваем по dedup_key, а не по key: адрес статьи меняется при переносе
+    между блогами, номер — нет. Внутри одной пачки тоже проверяем, иначе лента,
+    отдавшая статью дважды под разными адресами, протащила бы обе.
     """
     if not items:
         return [], 0
     with connect() as conn:
-        rows = conn.execute("SELECT key FROM news").fetchall()
-    seen = {row["key"] for row in rows}
-    unseen = [item for item in items if item["key"] not in seen]
+        rows = conn.execute("SELECT dedup_key FROM news").fetchall()
+    seen = {row["dedup_key"] for row in rows if row["dedup_key"]}
+
+    unseen = []
+    for item in items:
+        marker = item.get("dedup_key") or dedup_key(item["key"], item.get("link", ""))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unseen.append(item)
     return unseen, len(items) - len(unseen)
 
 
@@ -139,6 +183,7 @@ def record(items, status):
     rows = [
         (
             item["key"],
+            item.get("dedup_key") or dedup_key(item["key"], item.get("link", "")),
             item["title"],
             item["link"],
             item["published"].isoformat() if item.get("published") else None,
@@ -152,8 +197,8 @@ def record(items, status):
     with connect() as conn:
         cursor = conn.executemany(
             "INSERT OR IGNORE INTO news "
-            "(key, title, link, published, summary, ai_summary, status, first_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(key, dedup_key, title, link, published, summary, ai_summary, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         return cursor.rowcount

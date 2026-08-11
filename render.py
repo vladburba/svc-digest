@@ -9,15 +9,16 @@ Telegram понимает узкий набор тегов: b, i, u, s, a, code,
 """
 
 import html
+from datetime import datetime
 
-from clock import now_local
-from collect import WINDOW_HOURS
+from clock import now_local, to_local
 
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
           "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
 MAX_LEN = 4096   # жёсткий лимит одного сообщения Telegram
 MAX_ITEMS = 5    # позиций в одном сообщении: компактно; больше — бьётся на сообщения
+MORNING_UNTIL = 12   # до этого часа по MSK заход считаем утренним
 
 
 def esc(text):
@@ -31,38 +32,98 @@ def human_date(moment=None):
     return f"{moment.day} {MONTHS[moment.month - 1]}"
 
 
-def render_funnel(funnel):
-    """Строка воронки для футера: сколько собрано → отобрано → отсеяно."""
+def period_hours(since_iso):
+    """Сколько часов прошло с прошлой отправки. None — если её не было.
+
+    Нужно, чтобы футер не врал: раньше там стояло «за сутки», а период на
+    самом деле считался с прошлой отправки. Пропустили одну (лежал Telegram) —
+    и «сутки» молча превращались в двое.
+    """
+    if not since_iso or since_iso.startswith("1970"):
+        return None
+    delta = now_local() - to_local(datetime.fromisoformat(since_iso))
+    return max(1, round(delta.total_seconds() / 3600))
+
+
+def render_filter_line(filter_funnel, waiting):
+    """Строка про заходы фильтра: когда отработал, чем кончилось, чего стоил.
+
+    Главное здесь — видимость провала. Раньше неудачные заходы ИИ просто
+    выпадали из статистики, и человек не мог отличить «сегодня новостей нет»
+    от «отбор не состоялся». Теперь провал подписан и сказано, сколько ждёт.
+    """
+    if not filter_funnel:
+        return ""
+    runs = filter_funnel.get("runs_list") or []
+    if not runs:
+        return "\n<i>🤖 Фильтрация: не запускалась</i>"
+
+    marks = []
+    for run in runs:
+        when = to_local(datetime.fromisoformat(run["ran_at"])).strftime("%H:%M")
+        marks.append(f"{when} ✗" if run["error"] else f"{when} ✓")
+    attempts = filter_funnel.get("attempts", 0)
+    cost = f" · {attempts} запр. к ИИ" if attempts else ""
+    line = f"\n<i>🤖 Фильтрация: {' · '.join(marks)}{cost}</i>"
+
+    if any(run["error"] for run in runs) and waiting:
+        line += f"\n<i>⏳ ИИ не ответил — {waiting} новостей ждут следующего окна</i>"
+    return line
+
+
+def render_funnel(funnel, filter_funnel=None, waiting=0, since=None):
+    """Футер: что собрано за период и что с этим сделал ИИ.
+
+    Из старой версии убрана строка «лента 40 → в окне 168ч 40»: она печаталась
+    неизменной 383 захода подряд (habr всегда отдаёт страницу из 40 записей,
+    все моложе недели), занимала половину футера и не сообщала ничего.
+    """
     if not funnel:
         return ""
+    hours = period_hours(since)
+    span = f"За {hours}ч" if hours else "За всё время"
     new = funnel.get("new_items", 0)
-    sel = funnel.get("selected", 0)
-    rej = funnel.get("rejected", 0)
-    feed = funnel.get("last_feed")
-    window = funnel.get("last_window")
-    lens = f"лента {feed} → в окне {WINDOW_HOURS}ч {window} · " if feed is not None else ""
-    return (f"\n\n<i>📊 За сутки: {lens}новых {new} "
-            f"→ ✅ в дайджест {sel}, ❌ ИИ отсеял {rej}</i>")
+    sel = (filter_funnel or {}).get("selected", 0)
+    rej = (filter_funnel or {}).get("rejected", 0)
+
+    text = f"\n\n<i>📊 {span}: новых {new} → ✅ отобрано {sel} · ❌ отсеяно {rej}</i>"
+    if funnel.get("failed_runs"):
+        text += f"\n<i>⚠️ Заходов сбора с ошибкой: {funnel['failed_runs']}</i>"
+    return text + render_filter_line(filter_funnel, waiting)
 
 
-def render_digest(items, funnel=None, overflow=0, part=1, parts=1, start_num=1):
+def digest_title():
+    """Шапка по времени суток: утренний заход или вечерний.
+
+    Отправок теперь две (08:30 и 20:30), и в ленте чата они должны различаться
+    с одного взгляда. Час берём местный, а не аргументом: cron и так знает,
+    когда зовёт, а лишний параметр — лишний повод рассинхрона.
+    """
+    return "🌅 Утренний" if now_local().hour < MORNING_UNTIL else "🌆 Вечерний"
+
+
+def render_digest(items, funnel=None, filter_funnel=None, waiting=0, since=None,
+                  overflow=0, part=1, parts=1, start_num=1):
     """Собирает HTML-текст ОДНОГО сообщения дайджеста.
 
     Когда новостей много, отправитель бьёт их на несколько сообщений и зовёт
     рендер на каждый кусок:
-      items    — записи этого сообщения (нарезку делает отправитель);
+      items      — записи этого сообщения (нарезку делает отправитель);
       part/parts — номер и всего сообщений («(2/3)» в шапке, если parts>1);
       start_num  — с какого номера нумеровать (сквозная нумерация через части);
-      overflow — остаток сверх потолка сообщений (придёт в следующий раз);
-      funnel   — воронка; кладём в ПОСЛЕДНЕЕ сообщение как сводку.
+      overflow   — остаток сверх потолка сообщений (придёт в следующий раз);
+      funnel     — воронка сбора; кладём в ПОСЛЕДНЕЕ сообщение как сводку;
+      filter_funnel — итог работы ИИ за период (туда же, в последнее);
+      waiting    — сколько записей ждёт фильтра прямо сейчас;
+      since      — момент прошлой отправки, чтобы честно подписать период.
     Пустой items → heartbeat «нового нет».
     """
     suffix = f"  <i>({part}/{parts})</i>" if parts > 1 else ""
-    head = f"📰 <b>Дайджест · {human_date()}</b>{suffix}"
-    tail = render_funnel(funnel)
+    head = f"📰 <b>{digest_title()} дайджест · {human_date()}</b>{suffix}"
+    tail = render_funnel(funnel, filter_funnel, waiting, since)
 
     if not items:
-        return head + "\n\nЗа последние сутки нового по твоим интересам не нашлось." + tail
+        return head + "\n\nНового по твоим интересам не нашлось." + tail
 
     blocks = []
     for i, item in enumerate(items, start_num):

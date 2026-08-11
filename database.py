@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""База — точка развязки сборщика и отправителя.
+"""База — точка развязки трёх работ конвейера.
 
-Сборщик ПИШЕТ: новые записи ленты после ИИ-отбора ложатся сюда со статусом
-  pending (отобрано) или rejected (ИИ забраковал). rejected хранится, чтобы
-  сборщик не гонял через ИИ одно и то же каждый час.
+Сборщик ПИШЕТ: свежие записи ленты ложатся сюда со статусом new. ИИ их ещё
+  не видел — сборщик его больше не зовёт вообще.
+Фильтр ЧИТАЕТ new и ПЕРЕВОДИТ: pending (отобрано) или rejected (забраковано).
+  Работает дважды в сутки, пакетом по всему накопленному.
 Отправитель ЧИТАЕТ: в 8:30 берёт всё pending, шлёт одним дайджестом, метит sent.
+
+Статусы записи: new → pending → sent, либо new → rejected, либо new → expired
+  (провисела дольше окна сбора и уже не новость). rejected и expired хранятся,
+  чтобы сборщик не тащил одно и то же в фильтр по кругу.
 
 База своя, отдельная от vladburba-bot.db: у SQLite один писатель (решение 6.04),
 и PII заявок/платежей дайджесту рядом не нужны.
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from clock import human
@@ -25,8 +30,9 @@ CREATE TABLE IF NOT EXISTS news (
     title         TEXT NOT NULL,
     link          TEXT NOT NULL,
     published     TEXT,                   -- ISO 8601 с зоной
-    ai_summary    TEXT,
-    status        TEXT NOT NULL,          -- pending | sent | rejected
+    summary       TEXT,                   -- текст из ленты: его читает фильтр
+    ai_summary    TEXT,                   -- выжимка от ИИ: её читает отправитель
+    status        TEXT NOT NULL,          -- new | pending | sent | rejected | expired
     first_seen_at TEXT NOT NULL,          -- когда сборщик обработал запись
     sent_at       TEXT,                   -- когда Telegram подтвердил приём
     message_id    INTEGER                 -- расписка Telegram
@@ -36,15 +42,37 @@ CREATE INDEX IF NOT EXISTS idx_news_status ON news(status);
 -- Журнал заходов сборщика: воронка каждого прогона. Нужен, чтобы отправитель
 -- в 08:30 собрал полную статистику за сутки и вложил её в сообщение
 -- (сам отправитель сбора не видит — работы развязаны).
+--
+-- Колонки selected/rejected остались от прежней схемы, где ИИ-отбор жил внутри
+-- сбора. Теперь отбор делает filter, и у новых записей здесь всегда NULL.
+-- Столбцы не удалены намеренно: в них лежит история до 2026-08-11, а DROP
+-- COLUMN ради двух неиспользуемых полей — риск без выгоды.
 CREATE TABLE IF NOT EXISTS collect_runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ran_at        TEXT NOT NULL,       -- ISO 8601 с зоной
     total_in_feed INTEGER,             -- сколько записей в ленте
-    in_window     INTEGER,             -- из них попали в окно 48ч
+    in_window     INTEGER,             -- из них попали в окно сбора
     already_seen  INTEGER,             -- дедуп отсеял (старые, уже в базе)
-    new_items     INTEGER,             -- новых пошло в ИИ
+    new_items     INTEGER,             -- новых записано со статусом new
+    selected      INTEGER,             -- НЕ ИСПОЛЬЗУЕТСЯ с 2026-08-11 (см. filter_runs)
+    rejected      INTEGER,             -- НЕ ИСПОЛЬЗУЕТСЯ с 2026-08-11 (см. filter_runs)
+    error         TEXT                 -- текст ошибки, если заход упал
+);
+
+-- Журнал заходов фильтра: по одной строке на каждое окно (08:00 и 20:00).
+-- Отдельно от collect_runs, потому что это отдельная работа со своим ритмом:
+-- сборщик ходит 24 раза в сутки и не тратит квоту, фильтр — дважды и тратит.
+-- attempts здесь — главная цифра надзора: сколько запросов реально ушло в
+-- OpenRouter (цепочка фолбэка на 429 делает их больше одного за заход).
+CREATE TABLE IF NOT EXISTS filter_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at        TEXT NOT NULL,       -- ISO 8601 с зоной
+    in_batch      INTEGER,             -- сколько записей ушло в модель одним пакетом
     selected      INTEGER,             -- ИИ отобрал
     rejected      INTEGER,             -- ИИ забраковал
+    expired       INTEGER,             -- протухло на этом заходе (не дождалось фильтра)
+    model         TEXT,                -- какая модель цепочки ответила
+    attempts      INTEGER,             -- запросов к OpenRouter за заход = расход квоты
     error         TEXT                 -- текст ошибки, если заход упал
 );
 """
@@ -69,16 +97,30 @@ def connect():
 
 
 def init_db():
-    """Идемпотентно: зовётся на старте каждой работы."""
+    """Идемпотентно: зовётся на старте каждой работы.
+
+    CREATE TABLE IF NOT EXISTS накрывает пустую базу, но НЕ доливает колонки в
+    уже существующую — для боевой базы нужен ALTER. Отсюда миграции ниже:
+    каждая обёрнута в try/except на «duplicate column», чтобы повторный запуск
+    (а он бывает каждый час) проходил молча.
+    """
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # 2026-08-11: сборщик перестал звать ИИ, и текст новости из ленты
+        # теперь обязан пережить паузу между сбором и фильтром — значит живёт
+        # в базе. До этого он существовал только в памяти одного прогона.
+        try:
+            conn.execute("ALTER TABLE news ADD COLUMN summary TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def filter_unseen(items):
     """Оставляет то, чего в базе ещё НЕТ (любой статус). → (новые, отсеяно).
 
-    Дедуп по всей базе: pending + sent + rejected. Если ключ уже есть в любом
-    статусе — запись мы уже обрабатывали, второй раз через ИИ не гоним.
+    Дедуп по всей базе: new + pending + sent + rejected + expired. Если ключ
+    уже есть в любом статусе — запись мы уже видели, второй раз не заводим.
     """
     if not items:
         return [], 0
@@ -100,6 +142,7 @@ def record(items, status):
             item["title"],
             item["link"],
             item["published"].isoformat() if item.get("published") else None,
+            item.get("summary", ""),
             item.get("ai_summary", ""),
             status,
             stamp,
@@ -109,11 +152,85 @@ def record(items, status):
     with connect() as conn:
         cursor = conn.executemany(
             "INSERT OR IGNORE INTO news "
-            "(key, title, link, published, ai_summary, status, first_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(key, title, link, published, summary, ai_summary, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         return cursor.rowcount
+
+
+def expire_old(window_hours):
+    """new, провисевшее дольше окна сбора → expired. → сколько протухло.
+
+    Зачем: запись выпадает из RSS-ленты через неделю, и если фильтр её к тому
+    моменту не разобрал (лежал ИИ, стоял сервер), новость уже неактуальна.
+    Без этого она вечно занимала бы место в пакете, вытесняя свежее.
+
+    Возраст считаем по дате публикации, а не по first_seen_at: неделю назад
+    вышедшая статья стара, даже если мы увидели её вчера. Нет даты — судим по
+    моменту, когда её записал сборщик.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE news SET status='expired' "
+            "WHERE status='new' AND COALESCE(published, first_seen_at) < ?",
+            (cutoff,),
+        )
+        return cursor.rowcount
+
+
+def get_new(limit):
+    """Пакет для фильтра: неотсмотренное, СВЕЖЕЕ сверху, не больше limit.
+
+    Свежее сверху, а не FIFO: если после простоя накопилось больше пакета,
+    в модель должно уйти актуальное, а хвост доберёт следующее окно —
+    либо он протухнет в expire_old, что для недельной новости и правильно.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT key, title, link, published, summary FROM news "
+            "WHERE status = 'new' "
+            "ORDER BY COALESCE(published, first_seen_at) DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_new():
+    """Сколько записей ждёт фильтра. Для лога и футера («ждут вечера»)."""
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM news WHERE status='new'").fetchone()
+    return row["n"]
+
+
+def apply_filter(selected, rejected_keys):
+    """Вердикт ИИ на пакет: new → pending (с выжимкой) либо new → rejected.
+
+    Условие status='new' в обоих UPDATE — не формальность: оно делает повтор
+    безвредным. Запустится фильтр дважды подряд (руками после сбоя, наложились
+    окна) — второй заход не тронет уже переведённые записи и не перепишет
+    отправленное.
+    """
+    n_selected = n_rejected = 0
+    with connect() as conn:
+        for item in selected:
+            cursor = conn.execute(
+                "UPDATE news SET status='pending', ai_summary=? "
+                "WHERE key=? AND status='new'",
+                (item.get("ai_summary", ""), item["key"]),
+            )
+            n_selected += cursor.rowcount
+        if rejected_keys:
+            placeholders = ",".join("?" * len(rejected_keys))
+            cursor = conn.execute(
+                f"UPDATE news SET status='rejected' "
+                f"WHERE key IN ({placeholders}) AND status='new'",
+                list(rejected_keys),
+            )
+            n_rejected = cursor.rowcount
+    return n_selected, n_rejected
 
 
 def get_pending():
@@ -155,19 +272,37 @@ def record_run(funnel):
         )
 
 
-def funnel_since(since_iso):
-    """Суммарная воронка заходов сборщика ПОСЛЕ момента since_iso.
+def record_filter_run(row):
+    """Пишет итог одного захода фильтра в журнал filter_runs."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO filter_runs "
+            "(ran_at, in_batch, selected, rejected, expired, model, attempts, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_iso(), row.get("in_batch"), row.get("selected"), row.get("rejected"),
+             row.get("expired"), row.get("model"), row.get("attempts"), row.get("error")),
+        )
 
-    Аргрегат за период между отправками: новых/отобрано/отсеяно — суммы;
-    лента/окно — снимок ПОСЛЕДНЕГО захода (складывать 40×24 бессмысленно).
+
+def funnel_since(since_iso):
+    """Воронка СБОРА за период после since_iso.
+
+    Новых — сумма по заходам; лента/окно — снимок ПОСЛЕДНЕГО захода (складывать
+    40×24 бессмысленно, это одна и та же страница ленты).
+
+    Заходы с ошибкой в сумму не идут: при провале сбора записи в базу не
+    попадают вовсе, а их new_items учёлся бы дважды — сначала здесь, потом в
+    удачном заходе, который те же записи наконец заведёт.
     """
     with connect() as conn:
         agg = conn.execute(
             "SELECT COUNT(*) runs, "
-            "COALESCE(SUM(new_items),0) new_items, "
-            "COALESCE(SUM(selected),0) selected, "
-            "COALESCE(SUM(rejected),0) rejected "
+            "COALESCE(SUM(new_items),0) new_items "
             "FROM collect_runs WHERE ran_at > ? AND error IS NULL",
+            (since_iso,),
+        ).fetchone()
+        failed = conn.execute(
+            "SELECT COUNT(*) n FROM collect_runs WHERE ran_at > ? AND error IS NOT NULL",
             (since_iso,),
         ).fetchone()
         last = conn.execute(
@@ -176,9 +311,37 @@ def funnel_since(since_iso):
             (since_iso,),
         ).fetchone()
     out = dict(agg)
+    out["failed_runs"] = failed["n"]
     out["last_feed"] = last["total_in_feed"] if last else None
     out["last_window"] = last["in_window"] if last else None
     out["last_seen"] = last["already_seen"] if last else None
+    return out
+
+
+def filter_funnel_since(since_iso):
+    """Итог работы ФИЛЬТРА за период после since_iso.
+
+    Возвращает суммы (отобрано/отсеяно/протухло/запросов к ИИ) и, отдельно,
+    список самих заходов — из него футер собирает строку «20:00 ✓ · 08:00 ✗».
+    Провалившиеся заходы здесь НУЖНЫ: молчание о них и есть то, что мы чиним.
+    """
+    with connect() as conn:
+        agg = conn.execute(
+            "SELECT COUNT(*) runs, "
+            "COALESCE(SUM(selected),0) selected, "
+            "COALESCE(SUM(rejected),0) rejected, "
+            "COALESCE(SUM(expired),0) expired, "
+            "COALESCE(SUM(attempts),0) attempts "
+            "FROM filter_runs WHERE ran_at > ?",
+            (since_iso,),
+        ).fetchone()
+        runs = conn.execute(
+            "SELECT ran_at, in_batch, selected, attempts, model, error FROM filter_runs "
+            "WHERE ran_at > ? ORDER BY ran_at",
+            (since_iso,),
+        ).fetchall()
+    out = dict(agg)
+    out["runs_list"] = [dict(row) for row in runs]
     return out
 
 
@@ -194,9 +357,11 @@ def stats():
     with connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS total, "
+            "SUM(status='new')      AS new, "
             "SUM(status='pending')  AS pending, "
             "SUM(status='sent')     AS sent, "
             "SUM(status='rejected') AS rejected, "
+            "SUM(status='expired')  AS expired, "
             "MAX(sent_at) AS last_sent FROM news"
         ).fetchone()
     return dict(row)
@@ -206,6 +371,7 @@ if __name__ == "__main__":
     init_db()
     s = stats()
     print(f"база: {DB_PATH}")
-    print(f"всего {s['total']} | pending {s['pending'] or 0} | "
+    print(f"всего {s['total']} | new {s['new'] or 0} | pending {s['pending'] or 0} | "
           f"sent {s['sent'] or 0} | rejected {s['rejected'] or 0} | "
-          f"последняя отправка: {human(s['last_sent']) or '—'}")
+          f"expired {s['expired'] or 0}")
+    print(f"последняя отправка: {human(s['last_sent']) or '—'}")

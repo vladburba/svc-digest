@@ -1,0 +1,26 @@
+# svc-digest — расписание конвейера. Копируется на PROD в /etc/cron.d/svc-digest
+#   scp svc-digest.cron vlad-main-root:/etc/cron.d/svc-digest
+#   ssh vlad-main-root 'chown root:root /etc/cron.d/svc-digest && chmod 644 /etc/cron.d/svc-digest'
+#
+# Права обязательны: cron.d молча игнорирует файл с чужим владельцем или
+# правом записи для группы. Проверить, что подхватился:
+#   ssh vlad-main-root 'grep CRON /var/log/syslog | tail -5'
+#
+# Время сервера = MSK. Три работы, разнесённые по ритму:
+#   collect — бесплатен (ИИ не трогает), поэтому каждый час
+#   filter  — единственный, кто тратит общую с ботом квоту OpenRouter → 2 раза
+#   send    — говорит с человеком, через 30 минут после отбора
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# СБОРЩИК — каждый час в :05. Копит новости со статусом new, в чат молчит.
+5 * * * * root cd /opt/apps/svc-digest && docker compose run --rm digest collect >> /opt/apps/svc-digest/cron.log 2>&1
+
+# ФИЛЬТР — 08:00 и 20:00. Отдаёт накопленное ИИ одним пакетом.
+# За 30 минут до отправки: запас на фолбэк по цепочке моделей.
+0 8 * * * root cd /opt/apps/svc-digest && docker compose run --rm digest filter >> /opt/apps/svc-digest/cron.log 2>&1
+0 20 * * * root cd /opt/apps/svc-digest && docker compose run --rm digest filter >> /opt/apps/svc-digest/cron.log 2>&1
+
+# ОТПРАВИТЕЛЬ — 08:30 (утренний, при пустой очереди шлёт heartbeat)
+#                20:30 (вечерний, при пустой очереди молчит).
+30 8 * * * root cd /opt/apps/svc-digest && docker compose run --rm digest send >> /opt/apps/svc-digest/cron.log 2>&1
+30 20 * * * root cd /opt/apps/svc-digest && docker compose run --rm digest send --quiet-if-empty >> /opt/apps/svc-digest/cron.log 2>&1

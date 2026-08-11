@@ -106,7 +106,11 @@ def select(items, model=None):
     Возвращает (отобранные записи с выжимками, счётчики стыка).
     """
     chain = [model] if model else OPENROUTER_MODELS_PRIORITY
-    stats = {"in": len(items), "out": 0, "model": None, "failed": [], "error": None}
+    # attempts — сколько запросов реально ушло в OpenRouter. Считаем ВСЕ, включая
+    # провальные: дневная квота аккаунта списывает и их, а квота у нас общая с
+    # vladburba-bot. Эта цифра — единственный честный расход конвейера.
+    stats = {"in": len(items), "out": 0, "model": None, "failed": [],
+             "attempts": 0, "error": None}
 
     if not items:
         return [], stats
@@ -121,6 +125,7 @@ def select(items, model=None):
 
     verdict = None
     for candidate in chain:
+        stats["attempts"] += 1
         try:
             verdict = ask_model(candidate, system_prompt, user_prompt, api_key)
             stats["model"] = candidate

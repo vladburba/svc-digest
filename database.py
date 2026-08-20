@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from clock import human
-from dedup import dedup_key
+from dedup import dedup_key, title_key
 
 DB_PATH = Path(__file__).resolve().parent / "digest.db"
 
@@ -155,22 +155,44 @@ def filter_unseen(items):
     Дедуп по всей базе: new + pending + sent + rejected + expired. Если запись
     уже есть в любом статусе — мы её видели, второй раз не заводим.
 
-    Сравниваем по dedup_key, а не по key: адрес статьи меняется при переносе
-    между блогами, номер — нет. Внутри одной пачки тоже проверяем, иначе лента,
-    отдавшая статью дважды под разными адресами, протащила бы обе.
+    Дедуп двухуровневый, и оба уровня появились от реальных дублей:
+      1) НОМЕР статьи вместо адреса — Habr переносит статью между блогами,
+         URL меняется целиком, номер остаётся (поймано 11.08.2026);
+      2) ЗАГОЛОВОК за последнюю неделю — один и тот же текст выходит под двумя
+         разными номерами, и первый уровень тут бессилен (поймано 18.08.2026).
+
+    Внутри одной пачки проверяем тоже, иначе лента, отдавшая статью дважды в
+    одном ответе, протащила бы обе.
     """
     if not items:
         return [], 0
+
+    # Окно для второго уровня: заголовки сравниваем только за последнюю неделю.
+    # По всей базе сравнивать нельзя — за годы накопятся законные совпадения
+    # вроде «Дайджест новостей», и мы начнём глушить свежие статьи.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     with connect() as conn:
         rows = conn.execute("SELECT dedup_key FROM news").fetchall()
+        recent = conn.execute(
+            "SELECT title FROM news WHERE COALESCE(published, first_seen_at) > ?",
+            (cutoff,),
+        ).fetchall()
     seen = {row["dedup_key"] for row in rows if row["dedup_key"]}
+    seen_titles = {title_key(row["title"]) for row in recent}
 
     unseen = []
     for item in items:
         marker = item.get("dedup_key") or dedup_key(item["key"], item.get("link", ""))
         if marker in seen:
             continue
+        # Второй уровень: тот же текст под другим номером статьи. Поймано
+        # 18.08.2026 — «DSL позволяют надежно использовать LLM» пришло дважды
+        # под номерами 1071572 и 1071582, номерной дедуп такое пропускает.
+        tkey = title_key(item.get("title", ""))
+        if tkey and tkey in seen_titles:
+            continue
         seen.add(marker)
+        seen_titles.add(tkey)
         unseen.append(item)
     return unseen, len(items) - len(unseen)
 
@@ -366,13 +388,21 @@ def funnel_since(since_iso):
 def filter_funnel_since(since_iso):
     """Итог работы ФИЛЬТРА за период после since_iso.
 
-    Возвращает суммы (отобрано/отсеяно/протухло/запросов к ИИ) и, отдельно,
-    список самих заходов — из него футер собирает строку «20:00 ✓ · 08:00 ✗».
+    Возвращает суммы (рассмотрено/отобрано/отсеяно/протухло/запросов) и,
+    отдельно, список самих заходов — из него футер собирает строку про окна.
     Провалившиеся заходы здесь НУЖНЫ: молчание о них и есть то, что мы чиним.
+
+    in_batch — сколько записей ушло в модель. Именно на нём строится футер:
+    внутри одного захода in_batch = selected + rejected всегда, проверено на
+    боевом журнале. А вот число собранных за период (collect_runs.new_items)
+    с этими цифрами НЕ сопоставимо — модель разбирает накопленную очередь, куда
+    входит собранное раньше. Их сложение в одну фразу и было той ложью, из-за
+    которой футер показывал «собрано 4, отобрано 5».
     """
     with connect() as conn:
         agg = conn.execute(
             "SELECT COUNT(*) runs, "
+            "COALESCE(SUM(in_batch),0) in_batch, "
             "COALESCE(SUM(selected),0) selected, "
             "COALESCE(SUM(rejected),0) rejected, "
             "COALESCE(SUM(expired),0) expired, "

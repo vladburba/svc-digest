@@ -95,7 +95,8 @@ python database.py                          # состояние базы по �
 
 ## PROD
 
-- Сервер `vlad-main` (<IP-сервера>), путь `/opt/apps/svc-digest`
+- Сервер `vlad-main` (адрес — в личных заметках, не в репозитории),
+  путь `/opt/apps/svc-digest`
 - Расписание `/etc/cron.d/svc-digest` от `root` (время сервера = MSK):
 
   | когда | что | зачем |

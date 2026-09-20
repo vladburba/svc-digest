@@ -30,18 +30,29 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 INTERESTS_FILE = BASE_DIR / "interests.md"
 TIMEOUT = 120.0
 
-# Отобраны боевым прогоном bench_models.py 2026-07-24: все три отсекли
-# контрольную запись, которую interests.md запрещает. Провайдеры РАЗНЫЕ —
-# чтобы 429 одного не валил всю цепочку.
+# Провайдеры РАЗНЫЕ намеренно: 429 у одного не должен валить всю цепочку.
+# Диверсификация именно по провайдеру, а не по вендору модели — OpenRouter
+# может маршрутизировать разные модели на один и тот же перегруженный бэкенд.
 #
-# Отвергнуты (пропускают запрещённое в interests.md):
+# Состав пересмотрен 2026-09-20 по журналу за месяц: google/gemma-4-26b-a4b-it
+# не ответила НИ РАЗУ за всё время (58 успешных заходов у nemotron, 10 у laguna,
+# 0 у gemma) и стабильно отдавала 429 — то есть третье звено просто жгло запрос
+# квоты, ни разу никого не выручив. Заменена на Nex AGI.
+#
+# Проверено живым прогоном на 20 новостях (2026-09-20, через прокси сервера):
+#   nex-agi/nex-n2.5-mini     14с, выбрал 5, выжимки по-русски   → взят
+#   dots-studio/dots-3-note   54с, выбрал 5, тоже чисто          → запасной
+#   google/gemma-4-31b-it     Provider returned error
+#   qwen/qwen3.8-27b          Provider returned error
+#   thinkingmachines/inkling  доступна только через agentic harness
+#
+# Отвергнуты раньше (пропускали запрещённое в interests.md):
 #   ling-3.0-flash · gpt-oss-20b · nemotron-nano-9b-v2 · north-mini-code
 #   nemotron-3-nano-30b · nemotron-3-nano-omni-30b
-# Отвергнуты (429 на прогоне): gemma-4-31b-it · laguna-s-2.1 · laguna-m.1
 OPENROUTER_MODELS_PRIORITY = [
-    "nvidia/nemotron-3-super-120b-a12b:free",  # Nvidia   — чисто, боевая у бота
-    "poolside/laguna-xs-2.1:free",             # Poolside — чисто, 9с
-    "google/gemma-4-26b-a4b-it:free",          # Google   — чисто, 6с
+    "nvidia/nemotron-3-super-120b-a12b:free",  # Nvidia   — основная рабочая
+    "poolside/laguna-xs-2.1:free",             # Poolside — быстрая подстраховка
+    "nex-agi/nex-n2.5-mini:free",              # Nex AGI  — третье звено с 2026-09-20
 ]
 
 
@@ -70,12 +81,39 @@ def build_system_prompt():
 
 
 def parse_response(raw):
-    """Достаёт JSON из ответа модели, даже если он завёрнут в ```-блок."""
+    """Достаёт JSON из ответа модели, что бы модель вокруг него ни написала.
+
+    Три попытки, от строгой к терпимой:
+      1. весь ответ целиком — так отвечает послушная модель;
+      2. содержимое ```-блока — в него заворачивают JSON по привычке из чатов;
+      3. кусок от первой «{» до последней «}» — спасает, когда модель сначала
+         рассуждает вслух («Хорошо, пользователь просит…»), а JSON кладёт следом.
+
+    Третий случай не выдумка: рассуждающие модели вроде nemotron ведут себя так
+    регулярно, и раньше такой ответ терялся целиком вместе с потраченным
+    запросом квоты.
+    """
     text = (raw or "").strip()
+    if not text:
+        raise ValueError("модель вернула пустой ответ")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.S)
     if fenced:
-        text = fenced.group(1)
-    return json.loads(text)
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+
+    raise ValueError(f"в ответе нет JSON: {text[:120]}")
 
 
 def ask_model(model, system_prompt, user_prompt, api_key):
@@ -95,7 +133,33 @@ def ask_model(model, system_prompt, user_prompt, api_key):
         timeout=TIMEOUT,
     )
     response.raise_for_status()
-    raw = response.json()["choices"][0]["message"]["content"]
+
+    # HTTP 200 у OpenRouter ещё не значит «ответ есть». Отказ провайдера
+    # приезжает внутри тела как {"error": ...}, а пока модель думает, в поток
+    # сыплются keep-alive пробелы — и если соединение оборвётся, тело окажется
+    # из одних пробелов. raise_for_status оба случая пропускает, поэтому
+    # конверт разбираем руками и говорим в лог, что именно пришло.
+    try:
+        body = response.json()
+    except ValueError:
+        head = (response.text or "").strip()[:120]
+        raise RuntimeError(f"тело ответа не JSON: {head or 'пусто (обрыв потока)'}") from None
+
+    if "choices" not in body:
+        err = (body.get("error") or {})
+        raise RuntimeError("провайдер вернул ошибку: "
+                           f"{err.get('message') or str(body)[:120]}")
+
+    message = body["choices"][0].get("message") or {}
+    raw = message.get("content")
+    if not raw:
+        # У рассуждающих моделей содержательная часть иногда уезжает в
+        # reasoning, а content приходит пустым — пробуем достать оттуда.
+        raw = message.get("reasoning") or message.get("reasoning_content")
+    if not raw:
+        raise RuntimeError("в ответе нет текста: "
+                           f"{str(message)[:120] or 'пустой message'}")
+
     return parse_response(raw)
 
 
@@ -133,7 +197,11 @@ def select(items, model=None):
             stats["model"] = candidate
             break
         except Exception as exc:
-            stats["failed"].append(f"{candidate}: {type(exc).__name__}")
+            # Пишем и текст, а не только класс: «JSONDecodeError» в логе не
+            # отличает обрыв соединения от болтливой модели, и месяц срывов
+            # пришлось разбирать вручную, повторяя запросы к провайдеру.
+            reason = str(exc).replace("\n", " ")[:130] or type(exc).__name__
+            stats["failed"].append(f"{candidate}: {type(exc).__name__}: {reason}")
 
     if verdict is None:
         stats["error"] = "вся цепочка моделей недоступна"

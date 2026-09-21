@@ -37,7 +37,7 @@ import render
 import telegram
 from clock import LocalFormatter
 from collect import WINDOW_HOURS, collect
-from filter_ai import select
+from filter_ai import OPENROUTER_MODELS_PRIORITY, select
 from render import MAX_ITEMS, render_digest, render_failure
 
 # Потолок сообщений за один заход отправителя. Было 5 (до 25 новостей за раз) —
@@ -131,18 +131,22 @@ def run_filter():
     """
     database.init_db()
     row = {"in_batch": 0, "selected": 0, "rejected": 0, "expired": 0,
-           "model": None, "attempts": 0, "error": None}
+           "model": None, "attempts": 0, "error": None,
+           "new_seen": 0, "queued_seen": 0, "interesting_new": 0, "left_queued": 0}
 
     # Сначала выносим протухшее: незачем занимать место в пакете новостью,
     # которая уже выпала из недельного окна ленты.
     row["expired"] = database.expire_old(WINDOW_HOURS)
     if row["expired"]:
-        log.info("протухло в очереди: %s (старше %sч)", row["expired"], WINDOW_HOURS)
+        log.info("протухло: %s (ждали дольше %sч)", row["expired"], WINDOW_HOURS)
 
-    waiting = database.count_new()
-    batch = database.get_new(BATCH_LIMIT)
+    fresh, queued = database.count_pool()
+    batch = database.get_pool(BATCH_LIMIT)
     row["in_batch"] = len(batch)
-    log.info("фильтр: в очереди %s | берём в пакет %s", waiting, len(batch))
+    row["new_seen"] = sum(1 for item in batch if item.get("is_new"))
+    row["queued_seen"] = len(batch) - row["new_seen"]
+    log.info("фильтр: ждут отбора %s (новых %s, из очереди %s) | берём в пакет %s",
+             fresh + queued, fresh, queued, len(batch))
 
     if not batch:
         database.record_filter_run(row)
@@ -152,6 +156,7 @@ def run_filter():
     selected, ai = select(batch)
     row["attempts"] = ai["attempts"]
     row["model"] = ai["model"]
+    database.record_model_attempts(ai["tries"])
     for failure in ai["failed"]:
         log.warning("фолбэк: %s", failure)
 
@@ -162,17 +167,25 @@ def run_filter():
                     "пакет ждёт следующего окна", ai["error"], ai["attempts"])
         return 1
 
-    picked = {item["key"] for item in selected}
-    rejected_keys = [item["key"] for item in batch if item["key"] not in picked]
-    row["selected"], row["rejected"] = database.apply_filter(selected, rejected_keys)
+    pool_keys = [item["key"] for item in batch]
+    row["selected"], row["rejected"], row["left_queued"] = database.apply_filter(
+        selected, ai["rejected_keys"], pool_keys)
+
+    # «Интересные из новых» — те новые, что модель НЕ назвала мимо интересов.
+    # Это первая строка диагностики: сколько свежего вообще стоило внимания.
+    rejected_set = set(ai["rejected_keys"])
+    row["interesting_new"] = sum(1 for item in batch
+                                 if item.get("is_new") and item["key"] not in rejected_set)
     database.record_filter_run(row)
 
-    log.info("отбор: %s в пакете → pending %s · rejected %s · модель %s · "
-             "запросов к ИИ %s",
-             len(batch), row["selected"], row["rejected"], ai["model"], ai["attempts"])
+    log.info("отбор: новых %s → интересных %s | из очереди %s | "
+             "конкурс %s → взял %s, оставил ждать %s | модель %s, запросов %s",
+             row["new_seen"], row["interesting_new"], row["queued_seen"],
+             row["interesting_new"] + row["queued_seen"], row["selected"],
+             row["left_queued"], ai["model"], ai["attempts"])
     st = database.stats()
-    log.info("база: new %s · pending %s · sent %s · rejected %s · expired %s",
-             st["new"] or 0, st["pending"] or 0, st["sent"] or 0,
+    log.info("база: new %s · queued %s · pending %s · sent %s · rejected %s · expired %s",
+             st["new"] or 0, st["queued"] or 0, st["pending"] or 0, st["sent"] or 0,
              st["rejected"] or 0, st["expired"] or 0)
     return 0
 
@@ -211,6 +224,7 @@ def run_send(quiet_if_empty=False):
             telegram.send_message(render_digest([], funnel, filter_funnel=filter_funnel,
                                                 waiting=waiting))
             log.info("отправка: pending пуст — послан сигнал «нового нет»")
+            send_diagnostics(0)
             return 0
 
         # Много новостей → несколько сообщений по MAX_ITEMS. Потолок MAX_MESSAGES
@@ -245,6 +259,7 @@ def run_send(quiet_if_empty=False):
 
         log.info("отправка: %s новостей в %s сообщ. (в очереди осталось %s)",
                  sent_total, parts, overflow)
+        send_diagnostics(sent_total)
         return 0
 
     except Exception as exc:
@@ -257,6 +272,27 @@ def run_send(quiet_if_empty=False):
         except Exception as notify_exc:
             log.critical("не смогли даже доложить о сбое: %s", notify_exc)
         return 1
+
+
+def send_diagnostics(sent_count):
+    """Служебное сообщение вслед за дайджестом: как отработал отбор.
+
+    Отдельным сообщением, а не футером — так дайджест остаётся про новости, а
+    диагностика не заставляет связывать свои числа с заголовками выше.
+    Падение здесь не должно ронять отправку: дайджест уже доставлен, и потеря
+    служебной сводки — мелочь по сравнению с паникой в чате.
+    """
+    try:
+        text = render.render_diagnostics(
+            run=database.last_filter_run(),
+            pool=database.count_pool(),
+            sent_count=sent_count,
+            models=database.model_stats(OPENROUTER_MODELS_PRIORITY),
+        )
+        telegram.send_message(text)
+        log.info("диагностика отправлена")
+    except Exception as exc:
+        log.warning("диагностику отправить не удалось: %s", exc)
 
 
 USAGE = ("запуск: python digest.py [collect|filter|send]\n"

@@ -74,9 +74,17 @@ def build_system_prompt():
         "«Что не нужно никогда» — жёсткий запрет. Порядок в «Что важнее при "
         "прочих равных» — шкала ранжирования: когда подходящего больше потолка, "
         "выигрывает то, что выше по списку.\n\n"
+        "Отбор двухшаговый, и в ответе нужны ОБА шага:\n"
+        "  1. selected — те, что берём в выпуск сейчас. Не больше потолка, "
+        "по убыванию важности.\n"
+        "  2. rejected — те, что мимо интересов и не пригодятся никогда.\n"
+        "Всё, что ты не назвал ни там, ни там, останется в очереди и будет "
+        "участвовать в следующем отборе наравне со свежими новостями. Именно "
+        "туда относи хорошее, что просто не поместилось в выпуск.\n\n"
         "Ответь СТРОГО в формате JSON, без пояснений и без markdown:\n"
-        '{"selected": [{"n": <номер из списка>, "summary": "<выжимка 1-2 предложения>"}]}\n'
-        'Если подходящего нет — верни {"selected": []}.'
+        '{"selected": [{"n": <номер>, "summary": "<выжимка 1-2 предложения>"}], '
+        '"rejected": [<номер>, <номер>]}\n'
+        'Если брать нечего — верни {"selected": [], "rejected": [...]}.'
     )
 
 
@@ -176,7 +184,10 @@ def select(items, model=None):
     # провальные: дневная квота аккаунта списывает и их, а квота у нас общая с
     # vladburba-bot. Эта цифра — единственный честный расход конвейера.
     stats = {"in": len(items), "out": 0, "model": None, "failed": [],
-             "attempts": 0, "error": None}
+             "attempts": 0, "error": None,
+             # tries — по строке на каждое обращение: (позиция, модель, ok, причина).
+             # Отсюда база узнаёт, какая модель работает, а какая всегда молчит.
+             "tries": [], "rejected_keys": []}
 
     if not items:
         return [], stats
@@ -190,13 +201,16 @@ def select(items, model=None):
     user_prompt = build_prompt(items)
 
     verdict = None
-    for candidate in chain:
+    for position, candidate in enumerate(chain, 1):
         stats["attempts"] += 1
         try:
             verdict = ask_model(candidate, system_prompt, user_prompt, api_key)
             stats["model"] = candidate
+            stats["tries"].append((position, candidate, True, None))
             break
         except Exception as exc:
+            stats["tries"].append((position, candidate, False,
+                                   str(exc).replace("\n", " ")[:130]))
             # Пишем и текст, а не только класс: «JSONDecodeError» в логе не
             # отличает обрыв соединения от болтливой модели, и месяц срывов
             # пришлось разбирать вручную, повторяя запросы к провайдеру.
@@ -216,6 +230,11 @@ def select(items, model=None):
             item = dict(items[idx - 1])
             item["ai_summary"] = (row.get("summary") or "").strip()
             selected.append(item)
+
+    # Отвергнутые модель называет номерами — превращаем в ключи записей.
+    for idx in verdict.get("rejected", []):
+        if isinstance(idx, int) and 1 <= idx <= len(items):
+            stats["rejected_keys"].append(items[idx - 1]["key"])
 
     stats["out"] = len(selected)
     return selected, stats

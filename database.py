@@ -7,9 +7,16 @@
   Работает дважды в сутки, пакетом по всему накопленному.
 Отправитель ЧИТАЕТ: в 8:30 берёт всё pending, шлёт одним дайджестом, метит sent.
 
-Статусы записи: new → pending → sent, либо new → rejected, либо new → expired
-  (провисела дольше окна сбора и уже не новость). rejected и expired хранятся,
-  чтобы сборщик не тащил одно и то же в фильтр по кругу.
+Статусы записи:
+  new      — собрана, ИИ ещё не видел
+  queued   — ИИ признал интересной, но места в выпуске не хватило; ждёт
+             следующего отбора и конкурирует там со свежими на равных
+  pending  — отобрана в ближайший выпуск
+  sent     — отправлена, есть расписка Telegram
+  rejected — мимо интересов, выбывает навсегда
+  expired  — ждала дольше окна сбора и уже не новость
+
+rejected и expired хранятся, чтобы сборщик не тащил одно и то же по кругу.
 
 База своя, отдельная от vladburba-bot.db: у SQLite один писатель (решение 6.04),
 и PII заявок/платежей дайджесту рядом не нужны.
@@ -34,7 +41,7 @@ CREATE TABLE IF NOT EXISTS news (
     published     TEXT,                   -- ISO 8601 с зоной
     summary       TEXT,                   -- текст из ленты: его читает фильтр
     ai_summary    TEXT,                   -- выжимка от ИИ: её читает отправитель
-    status        TEXT NOT NULL,          -- new | pending | sent | rejected | expired
+    status        TEXT NOT NULL,          -- new | queued | pending | sent | rejected | expired
     first_seen_at TEXT NOT NULL,          -- когда сборщик обработал запись
     sent_at       TEXT,                   -- когда Telegram подтвердил приём
     message_id    INTEGER                 -- расписка Telegram
@@ -75,13 +82,29 @@ CREATE TABLE IF NOT EXISTS filter_runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ran_at        TEXT NOT NULL,       -- ISO 8601 с зоной
     in_batch      INTEGER,             -- сколько записей ушло в модель одним пакетом
-    selected      INTEGER,             -- ИИ отобрал
-    rejected      INTEGER,             -- ИИ забраковал
+    selected      INTEGER,             -- ИИ отобрал в выпуск
+    rejected      INTEGER,             -- ИИ забраковал как мимо интересов
     expired       INTEGER,             -- протухло на этом заходе (не дождалось фильтра)
     model         TEXT,                -- какая модель цепочки ответила
     attempts      INTEGER,             -- запросов к OpenRouter за заход = расход квоты
     error         TEXT                 -- текст ошибки, если заход упал
 );
+
+-- Журнал обращений к моделям: по строке на КАЖДЫЙ запрос, включая неудачные.
+-- Нужен, чтобы честно отвечать на вопрос «какая модель работает, а какая
+-- всегда молчит». Из filter_runs это не вывести: там виден только итог захода,
+-- а состав цепочки со временем меняется (2026-09-20 третье звено заменено),
+-- и восстановленная задним числом статистика приписала бы новой модели чужие
+-- отказы. Копим за всё время, без скользящих окон — так решено 2026-09-21.
+CREATE TABLE IF NOT EXISTS model_attempts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at        TEXT NOT NULL,       -- когда был заход фильтра
+    position      INTEGER,             -- место в цепочке на момент запроса
+    model         TEXT NOT NULL,
+    ok            INTEGER NOT NULL,    -- 1 ответила, 0 промолчала
+    error         TEXT                 -- краткая причина отказа
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_model ON model_attempts(model);
 """
 
 
@@ -140,6 +163,19 @@ def init_db():
                 "UPDATE news SET dedup_key = ? WHERE id = ?",
                 [(dedup_key(row["key"], row["link"]), row["id"]) for row in stale],
             )
+
+        # 2026-09-21: отбор стал двухшаговым (фильтр «интересно/мимо», затем
+        # конкурс за места в выпуске), и диагностика показывает обе стадии.
+        # Эти числа знает только сам заход — значит их надо сохранять.
+        for column in ("new_seen INTEGER",        # новых статей в пакете
+                       "queued_seen INTEGER",     # сколько пришло из очереди
+                       "interesting_new INTEGER", # новых признано интересными
+                       "left_queued INTEGER"):    # осталось ждать после конкурса
+            try:
+                conn.execute(f"ALTER TABLE filter_runs ADD COLUMN {column}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
         # Только теперь, когда колонка гарантированно есть. Индекс НЕ уникальный:
         # в базе лежат четыре пары дублей, приехавших до 2026-08-12, и UNIQUE не
@@ -227,7 +263,11 @@ def record(items, status):
 
 
 def expire_old(window_hours):
-    """new, провисевшее дольше окна сбора → expired. → сколько протухло.
+    """Всё, что ждёт отбора дольше окна сбора → expired. → сколько протухло.
+
+    Чистит и новые, и очередь: «вечная конкуренция» на практике ограничена
+    неделей жизни новости, иначе хороший, но невезучий материал крутился бы
+    в пакете бесконечно, занимая место и токены.
 
     Зачем: запись выпадает из RSS-ленты через неделю, и если фильтр её к тому
     моменту не разобрал (лежал ИИ, стоял сервер), новость уже неактуальна.
@@ -241,23 +281,32 @@ def expire_old(window_hours):
     with connect() as conn:
         cursor = conn.execute(
             "UPDATE news SET status='expired' "
-            "WHERE status='new' AND COALESCE(published, first_seen_at) < ?",
+            "WHERE status IN ('new','queued') AND COALESCE(published, first_seen_at) < ?",
             (cutoff,),
         )
         return cursor.rowcount
 
 
-def get_new(limit):
-    """Пакет для фильтра: неотсмотренное, СВЕЖЕЕ сверху, не больше limit.
+def get_pool(limit):
+    """Кандидаты на ближайший выпуск: и новые, и ждущие в очереди.
 
-    Свежее сверху, а не FIFO: если после простоя накопилось больше пакета,
-    в модель должно уйти актуальное, а хвост доберёт следующее окно —
-    либо он протухнет в expire_old, что для недельной новости и правильно.
+    Очередь здесь полноправный участник, а не отстойник. Статья, признанная
+    интересной, но не попавшая в пятёрку, остаётся в игре и в следующем окне
+    конкурирует со свежими на равных: в урожайный день сильный материал
+    подождёт, в пустой — выйдет вперёд (решение Влада 2026-09-21).
+
+    Свежее сверху: если пул перерос потолок пакета, в модель уходит актуальное,
+    а хвост доберёт следующее окно либо протухнет в expire_old — для новости
+    старше недели это и правильно.
+
+    В каждой записи есть is_new: 1 — статья попала к ИИ впервые, 0 — пришла из
+    очереди. На этом различии стоит вся диагностика («новых 20, из очереди 6»).
     """
     with connect() as conn:
         rows = conn.execute(
-            "SELECT key, title, link, published, summary FROM news "
-            "WHERE status = 'new' "
+            "SELECT key, title, link, published, summary, "
+            "       (status = 'new') AS is_new "
+            "FROM news WHERE status IN ('new', 'queued') "
             "ORDER BY COALESCE(published, first_seen_at) DESC "
             "LIMIT ?",
             (limit,),
@@ -265,39 +314,70 @@ def get_new(limit):
     return [dict(row) for row in rows]
 
 
-def count_new():
-    """Сколько записей ждёт фильтра. Для лога и футера («ждут вечера»)."""
+def count_pool():
+    """Сколько ждёт ближайшего отбора: (новых, из очереди)."""
     with connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS n FROM news WHERE status='new'").fetchone()
-    return row["n"]
+        row = conn.execute(
+            "SELECT SUM(status='new') AS n, SUM(status='queued') AS q FROM news"
+        ).fetchone()
+    return (row["n"] or 0), (row["q"] or 0)
 
 
-def apply_filter(selected, rejected_keys):
-    """Вердикт ИИ на пакет: new → pending (с выжимкой) либо new → rejected.
+def count_new():
+    """Сколько всего ждёт отбора — новых плюс очередь."""
+    fresh, queued = count_pool()
+    return fresh + queued
 
-    Условие status='new' в обоих UPDATE — не формальность: оно делает повтор
-    безвредным. Запустится фильтр дважды подряд (руками после сбоя, наложились
-    окна) — второй заход не тронет уже переведённые записи и не перепишет
-    отправленное.
+
+def apply_filter(selected, rejected_keys, pool_keys):
+    """Вердикт ИИ на пакет — три исхода вместо прежних двух.
+
+      взят       → pending, с выжимкой, уйдёт ближайшим выпуском;
+      мимо       → rejected, выбывает навсегда;
+      остальные  → queued, ждут следующего конкурса.
+
+    Третий исход появился 2026-09-21. До него всё, что не взято, считалось
+    отвергнутым — и статья, которая была хороша, но не влезла в пятёрку,
+    выбывала насовсем. Теперь модель явно называет только мусор, а всё
+    неназванное остаётся в игре.
+
+    Условие по текущему статусу во всех UPDATE делает повтор безвредным:
+    запустится фильтр дважды (руками после сбоя, наложились окна) — второй
+    заход не тронет уже переведённое и не перепишет отправленное.
     """
-    n_selected = n_rejected = 0
+    n_selected = n_rejected = n_queued = 0
+    chosen = {item["key"] for item in selected}
+    rejected_set = set(rejected_keys)
+    leftover = [k for k in pool_keys if k not in chosen and k not in rejected_set]
+
     with connect() as conn:
         for item in selected:
             cursor = conn.execute(
                 "UPDATE news SET status='pending', ai_summary=? "
-                "WHERE key=? AND status='new'",
+                "WHERE key=? AND status IN ('new','queued')",
                 (item.get("ai_summary", ""), item["key"]),
             )
             n_selected += cursor.rowcount
-        if rejected_keys:
-            placeholders = ",".join("?" * len(rejected_keys))
+
+        if rejected_set:
+            marks = ",".join("?" * len(rejected_set))
             cursor = conn.execute(
                 f"UPDATE news SET status='rejected' "
-                f"WHERE key IN ({placeholders}) AND status='new'",
-                list(rejected_keys),
+                f"WHERE key IN ({marks}) AND status IN ('new','queued')",
+                list(rejected_set),
             )
             n_rejected = cursor.rowcount
-    return n_selected, n_rejected
+
+        if leftover:
+            marks = ",".join("?" * len(leftover))
+            cursor = conn.execute(
+                f"UPDATE news SET status='queued' "
+                f"WHERE key IN ({marks}) AND status='new'",
+                leftover,
+            )
+            n_queued = cursor.rowcount
+
+    return n_selected, n_rejected, n_queued
 
 
 def get_pending():
@@ -344,11 +424,64 @@ def record_filter_run(row):
     with connect() as conn:
         conn.execute(
             "INSERT INTO filter_runs "
-            "(ran_at, in_batch, selected, rejected, expired, model, attempts, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(ran_at, in_batch, selected, rejected, expired, model, attempts, error, "
+            " new_seen, queued_seen, interesting_new, left_queued) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now_iso(), row.get("in_batch"), row.get("selected"), row.get("rejected"),
-             row.get("expired"), row.get("model"), row.get("attempts"), row.get("error")),
+             row.get("expired"), row.get("model"), row.get("attempts"), row.get("error"),
+             row.get("new_seen"), row.get("queued_seen"),
+             row.get("interesting_new"), row.get("left_queued")),
         )
+
+
+def record_model_attempts(attempts):
+    """Пишет каждое обращение к модели: [(позиция, модель, ok, причина), ...].
+
+    Пишем ВСЕ попытки, включая неудачные — иначе не ответить на вопрос «какая
+    модель вообще работает». Одна строка = один потраченный запрос квоты.
+    """
+    if not attempts:
+        return
+    stamp = now_iso()
+    with connect() as conn:
+        conn.executemany(
+            "INSERT INTO model_attempts (ran_at, position, model, ok, error) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(stamp, pos, model, 1 if ok else 0, err) for pos, model, ok, err in attempts],
+        )
+
+
+def model_stats(chain=None):
+    """Сводка по моделям за ВСЁ время: сколько раз спросили и сколько ответила.
+
+    Без скользящего окна — решение Влада 2026-09-21: нужна не «форма за
+    неделю», а простой ответ, работает модель или нет.
+
+    chain — текущий состав цепочки; модели из него показываются всегда, даже
+    если их ещё ни разу не спрашивали (иначе новичок молча отсутствовал бы в
+    диагностике). Выбывшие из цепочки модели, наоборот, не показываем: их
+    история интересна при разборе, а не в ежедневном отчёте.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT model, COUNT(*) AS asked, "
+            "       COALESCE(SUM(ok), 0) AS answered, MAX(ran_at) AS last_seen "
+            "FROM model_attempts GROUP BY model"
+        ).fetchall()
+    known = {r["model"]: dict(r) for r in rows}
+    if chain is None:
+        return sorted(known.values(), key=lambda r: -r["asked"])
+    return [known.get(m, {"model": m, "asked": 0, "answered": 0, "last_seen": None})
+            for m in chain]
+
+
+def last_filter_run():
+    """Последний заход фильтра целиком — из него строится диагностика."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM filter_runs ORDER BY ran_at DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def funnel_since(since_iso):
@@ -433,6 +566,7 @@ def stats():
         row = conn.execute(
             "SELECT COUNT(*) AS total, "
             "SUM(status='new')      AS new, "
+            "SUM(status='queued')   AS queued, "
             "SUM(status='pending')  AS pending, "
             "SUM(status='sent')     AS sent, "
             "SUM(status='rejected') AS rejected, "

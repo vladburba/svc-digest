@@ -193,14 +193,25 @@ def render_diagnostics(run, pool, sent_count, models):
                 mark, verdict = "⚠️", "через раз"
             short = m["model"].split("/")[-1].replace(":free", "")
             vendor = m["model"].split("/")[0]
-            lines.append(f"{mark} {i}. {esc(short)} ({esc(vendor)}) — {verdict}, "
-                         f"обращений {asked} · ответила {answered}")
+            row = (f"{mark} {i}. {esc(short)} ({esc(vendor)}) — {verdict}, "
+                   f"обращений {asked} · ответила {answered}")
+            # Время ответа показываем только тем, кто вообще отвечал: иначе
+            # строка врала бы прочерком там, где модель молчит по-настоящему.
+            if m.get("avg_ok"):
+                # Быстрый ответ округлялся до «0 с» и выглядел поломкой.
+                fmt = lambda s: f"{s:.0f} с" if s >= 10 else f"{s:.1f} с"
+                row += (f"\n      думает {fmt(m['avg_ok'])} в среднем, "
+                        f"дольше всего {fmt(m['max_ok'])}")
+            lines.append(row)
 
     if run and not run.get("error") and run.get("model"):
         short = run["model"].split("/")[-1].replace(":free", "")
-        lines += ["", f"<i>Этот отбор: {run.get('attempts') or 0} "
-                      f"{plural(run.get('attempts') or 0, 'запрос', 'запроса', 'запросов')}, "
-                      f"ответила {esc(short)}</i>"]
+        tail = (f"<i>Этот отбор: {run.get('attempts') or 0} "
+                f"{plural(run.get('attempts') or 0, 'запрос', 'запроса', 'запросов')}, "
+                f"ответила {esc(short)}")
+        if run.get("seconds"):
+            tail += f" за {run['seconds']:.0f} с"
+        lines += ["", tail + "</i>"]
     return "\n".join(lines)
 
 

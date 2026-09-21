@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS model_attempts (
     position      INTEGER,             -- место в цепочке на момент запроса
     model         TEXT NOT NULL,
     ok            INTEGER NOT NULL,    -- 1 ответила, 0 промолчала
+    seconds       REAL,                -- сколько думала: и при успехе, и при отказе
     error         TEXT                 -- краткая причина отказа
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_model ON model_attempts(model);
@@ -167,7 +168,8 @@ def init_db():
         # 2026-09-21: отбор стал двухшаговым (фильтр «интересно/мимо», затем
         # конкурс за места в выпуске), и диагностика показывает обе стадии.
         # Эти числа знает только сам заход — значит их надо сохранять.
-        for column in ("new_seen INTEGER",        # новых статей в пакете
+        for column in ("seconds REAL",           # сколько думала ответившая модель
+                       "new_seen INTEGER",        # новых статей в пакете
                        "queued_seen INTEGER",     # сколько пришло из очереди
                        "interesting_new INTEGER", # новых признано интересными
                        "left_queued INTEGER"):    # осталось ждать после конкурса
@@ -176,6 +178,14 @@ def init_db():
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+
+        # 2026-09-21: замеряем, сколько модель думала над ответом — чтобы
+        # видеть, укладываются ли они в бюджет захода, а не гадать.
+        try:
+            conn.execute("ALTER TABLE model_attempts ADD COLUMN seconds REAL")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
         # Только теперь, когда колонка гарантированно есть. Индекс НЕ уникальный:
         # в базе лежат четыре пары дублей, приехавших до 2026-08-12, и UNIQUE не
@@ -425,29 +435,32 @@ def record_filter_run(row):
         conn.execute(
             "INSERT INTO filter_runs "
             "(ran_at, in_batch, selected, rejected, expired, model, attempts, error, "
-            " new_seen, queued_seen, interesting_new, left_queued) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " new_seen, queued_seen, interesting_new, left_queued, seconds) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now_iso(), row.get("in_batch"), row.get("selected"), row.get("rejected"),
              row.get("expired"), row.get("model"), row.get("attempts"), row.get("error"),
              row.get("new_seen"), row.get("queued_seen"),
-             row.get("interesting_new"), row.get("left_queued")),
+             row.get("interesting_new"), row.get("left_queued"), row.get("seconds")),
         )
 
 
 def record_model_attempts(attempts):
-    """Пишет каждое обращение к модели: [(позиция, модель, ok, причина), ...].
+    """Пишет обращения к модели: [(позиция, модель, ok, причина, секунды), ...].
 
     Пишем ВСЕ попытки, включая неудачные — иначе не ответить на вопрос «какая
     модель вообще работает». Одна строка = один потраченный запрос квоты.
+    Время держим и для отказов: быстрый отказ (429 приходит за секунду) и
+    долгое молчание с обрывом — разные болезни, и лечатся по-разному.
     """
     if not attempts:
         return
     stamp = now_iso()
     with connect() as conn:
         conn.executemany(
-            "INSERT INTO model_attempts (ran_at, position, model, ok, error) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [(stamp, pos, model, 1 if ok else 0, err) for pos, model, ok, err in attempts],
+            "INSERT INTO model_attempts (ran_at, position, model, ok, error, seconds) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(stamp, pos, model, 1 if ok else 0, err, secs)
+             for pos, model, ok, err, secs in attempts],
         )
 
 
@@ -465,14 +478,16 @@ def model_stats(chain=None):
     with connect() as conn:
         rows = conn.execute(
             "SELECT model, COUNT(*) AS asked, "
-            "       COALESCE(SUM(ok), 0) AS answered, MAX(ran_at) AS last_seen "
+            "       COALESCE(SUM(ok), 0) AS answered, MAX(ran_at) AS last_seen, "
+            "       AVG(CASE WHEN ok = 1 THEN seconds END) AS avg_ok, "
+            "       MAX(CASE WHEN ok = 1 THEN seconds END) AS max_ok "
             "FROM model_attempts GROUP BY model"
         ).fetchall()
     known = {r["model"]: dict(r) for r in rows}
     if chain is None:
         return sorted(known.values(), key=lambda r: -r["asked"])
-    return [known.get(m, {"model": m, "asked": 0, "answered": 0, "last_seen": None})
-            for m in chain]
+    blank = {"asked": 0, "answered": 0, "last_seen": None, "avg_ok": None, "max_ok": None}
+    return [known.get(m, dict(blank, model=m)) for m in chain]
 
 
 def last_filter_run():

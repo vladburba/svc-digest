@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -28,7 +29,24 @@ load_dotenv(BASE_DIR / ".env")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 INTERESTS_FILE = BASE_DIR / "interests.md"
-TIMEOUT = 120.0
+
+# Сколько ждать ОДНУ модель. Было 120с; поднято до 600с 2026-09-21 по мысли
+# читателей репозитория: рассуждающие модели думают долго, а спешить нам
+# некуда — между отбором (08:00) и отправкой (08:30) полчаса простоя.
+# Замер за всё время: медиана удачного захода 29с, максимум 159с, таймаут не
+# срабатывал ни разу. То есть запас берётся на будущее, а не по нужде.
+TIMEOUT = 600.0
+
+# Потолок на ВЕСЬ заход, а не на запрос — вот что важнее числа выше. Моделей в
+# цепочке три, и 600с на каждую в худшем случае дали бы полчаса с лишним: отбор
+# закончился бы уже после отправки, а дайджест ушёл бы без свежих новостей.
+# 1500с (25 минут) гарантируют, что заход уложится в окно до 08:30 при любом
+# раскладе. Приём тот же, что в vladburba-bot, где стоит общий бюджет на ответ.
+TOTAL_BUDGET = 1500.0
+
+# Если бюджета осталось меньше этого, новую попытку не начинаем: успеть она
+# всё равно не успеет, а запрос из дневной квоты спишется.
+MIN_ATTEMPT = 30.0
 
 # Провайдеры РАЗНЫЕ намеренно: 429 у одного не должен валить всю цепочку.
 # Диверсификация именно по провайдеру, а не по вендору модели — OpenRouter
@@ -124,7 +142,7 @@ def parse_response(raw):
     raise ValueError(f"в ответе нет JSON: {text[:120]}")
 
 
-def ask_model(model, system_prompt, user_prompt, api_key):
+def ask_model(model, system_prompt, user_prompt, api_key, timeout=TIMEOUT):
     """Один запрос к одной модели. Бросает исключение при любой беде."""
     response = httpx.post(
         OPENROUTER_URL,
@@ -138,7 +156,7 @@ def ask_model(model, system_prompt, user_prompt, api_key):
             "temperature": 0.2,
         },
         proxy=EGRESS_PROXY,
-        timeout=TIMEOUT,
+        timeout=timeout,
     )
     response.raise_for_status()
 
@@ -187,7 +205,7 @@ def select(items, model=None):
              "attempts": 0, "error": None,
              # tries — по строке на каждое обращение: (позиция, модель, ok, причина).
              # Отсюда база узнаёт, какая модель работает, а какая всегда молчит.
-             "tries": [], "rejected_keys": []}
+             "tries": [], "rejected_keys": [], "seconds": None}
 
     if not items:
         return [], stats
@@ -201,21 +219,34 @@ def select(items, model=None):
     user_prompt = build_prompt(items)
 
     verdict = None
+    started = time.monotonic()
     for position, candidate in enumerate(chain, 1):
+        left = TOTAL_BUDGET - (time.monotonic() - started)
+        if left < MIN_ATTEMPT:
+            # Бюджет захода вышел. Молча прекращаем: следующая попытка не
+            # успеет ответить до отправки, но запрос квоты спишет.
+            stats["failed"].append(f"{candidate}: бюджет захода исчерпан, "
+                                   f"осталось {left:.0f}с — не спрашиваем")
+            break
+
         stats["attempts"] += 1
+        attempt_started = time.monotonic()
         try:
-            verdict = ask_model(candidate, system_prompt, user_prompt, api_key)
+            verdict = ask_model(candidate, system_prompt, user_prompt, api_key,
+                                timeout=min(TIMEOUT, left))
+            spent = time.monotonic() - attempt_started
             stats["model"] = candidate
-            stats["tries"].append((position, candidate, True, None))
+            stats["seconds"] = round(spent, 1)
+            stats["tries"].append((position, candidate, True, None, round(spent, 1)))
             break
         except Exception as exc:
-            stats["tries"].append((position, candidate, False,
-                                   str(exc).replace("\n", " ")[:130]))
+            spent = time.monotonic() - attempt_started
             # Пишем и текст, а не только класс: «JSONDecodeError» в логе не
             # отличает обрыв соединения от болтливой модели, и месяц срывов
             # пришлось разбирать вручную, повторяя запросы к провайдеру.
             reason = str(exc).replace("\n", " ")[:130] or type(exc).__name__
-            stats["failed"].append(f"{candidate}: {type(exc).__name__}: {reason}")
+            stats["tries"].append((position, candidate, False, reason, round(spent, 1)))
+            stats["failed"].append(f"{candidate}: {type(exc).__name__} за {spent:.0f}с: {reason}")
 
     if verdict is None:
         stats["error"] = "вся цепочка моделей недоступна"

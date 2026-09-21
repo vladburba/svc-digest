@@ -132,7 +132,8 @@ def run_filter():
     database.init_db()
     row = {"in_batch": 0, "selected": 0, "rejected": 0, "expired": 0,
            "model": None, "attempts": 0, "error": None,
-           "new_seen": 0, "queued_seen": 0, "interesting_new": 0, "left_queued": 0}
+           "new_seen": 0, "queued_seen": 0, "interesting_new": 0, "left_queued": 0,
+           "seconds": None}
 
     # Сначала выносим протухшее: незачем занимать место в пакете новостью,
     # которая уже выпала из недельного окна ленты.
@@ -156,6 +157,7 @@ def run_filter():
     selected, ai = select(batch)
     row["attempts"] = ai["attempts"]
     row["model"] = ai["model"]
+    row["seconds"] = ai.get("seconds")
     database.record_model_attempts(ai["tries"])
     for failure in ai["failed"]:
         log.warning("фолбэк: %s", failure)

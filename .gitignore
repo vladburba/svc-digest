@@ -8,3 +8,6 @@ __pycache__/
 # Общие настройки проекта (.claude/settings.json), если появятся, отслеживаем.
 .claude/settings.local.json
 .claude/*.tmp.*
+
+# Сгенерированные страницы разметки — собираются из шаблона make_page.py
+eval/kartoteka-*.html

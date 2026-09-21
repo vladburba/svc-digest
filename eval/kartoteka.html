@@ -1,0 +1,325 @@
+<title>Картотека дайджеста</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --ground:   #F2F3F0;
+    --surface:  #FFFFFF;
+    --raised:   #FAFAF8;
+    --ink:      #15171A;
+    --muted:    #666C74;
+    --hair:     #DCDFD9;
+    --accent:   #24487A;
+    --plus:     #2E7350;
+    --minus:    #A6392C;
+    --skip:     #7E858E;
+    --plus-bg:  #E7F0EA;
+    --minus-bg: #F7E8E6;
+    --skip-bg:  #ECEEEF;
+    --shadow:   0 1px 2px rgba(20,23,26,.06), 0 4px 14px rgba(20,23,26,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #131518; --surface: #1B1E23; --raised: #22262C;
+      --ink: #E6E8E9; --muted: #98A0A8; --hair: #2C3138; --accent: #7CA3DC;
+      --plus: #6FBF8E; --minus: #E08579; --skip: #8E959D;
+      --plus-bg: #1B2A22; --minus-bg: #2C1E1C; --skip-bg: #23272D;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #131518; --surface: #1B1E23; --raised: #22262C;
+    --ink: #E6E8E9; --muted: #98A0A8; --hair: #2C3138; --accent: #7CA3DC;
+    --plus: #6FBF8E; --minus: #E08579; --skip: #8E959D;
+    --plus-bg: #1B2A22; --minus-bg: #2C1E1C; --skip-bg: #23272D;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.25);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: "Golos Text", "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+  }
+
+  .bar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--ground) 88%, transparent);
+    backdrop-filter: blur(10px); border-bottom: 1px solid var(--hair);
+  }
+  .bar-in {
+    max-width: 840px; margin: 0 auto; padding: 14px 20px 12px;
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  .brand { font-weight: 700; font-size: 17px; letter-spacing: -.01em; }
+  .brand span { color: var(--muted); font-weight: 500; font-size: 14px; }
+  .tally { margin-left: auto; display: flex; gap: 14px; font-size: 13px; }
+  .tally b {
+    font-family: "JetBrains Mono", monospace; font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .t-plus b { color: var(--plus); }
+  .t-minus b { color: var(--minus); }
+  .t-skip b { color: var(--skip); }
+  .tally i { font-style: normal; color: var(--muted); }
+  .track { height: 3px; background: var(--hair); }
+  .fill { height: 100%; width: 0; background: var(--accent); transition: width .25s ease; }
+
+  .hint {
+    max-width: 840px; margin: 22px auto 0; padding: 0 20px;
+    color: var(--muted); font-size: 14px;
+  }
+  .hint kbd {
+    font-family: "JetBrains Mono", monospace; font-size: 12px;
+    background: var(--raised); border: 1px solid var(--hair);
+    border-radius: 3px; padding: 1px 6px; color: var(--ink);
+  }
+
+  main { max-width: 840px; margin: 0 auto; padding: 18px 20px 40px; display: grid; gap: 10px; }
+  .card {
+    display: grid; grid-template-columns: 44px 1fr;
+    background: var(--surface); border: 1px solid var(--hair);
+    border-left: 3px solid transparent; border-radius: 4px;
+    box-shadow: var(--shadow); scroll-margin-top: 96px;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .card.current { border-color: var(--accent); }
+  .card[data-v="+"] { border-left-color: var(--plus); background: var(--plus-bg); }
+  .card[data-v="-"] { border-left-color: var(--minus); background: var(--minus-bg); }
+  .card[data-v="0"] { border-left-color: var(--skip); background: var(--skip-bg); }
+
+  .num {
+    font-family: "JetBrains Mono", monospace; font-size: 13px;
+    font-variant-numeric: tabular-nums; color: var(--muted); padding: 16px 0 0 14px;
+  }
+  .body { padding: 14px 16px 14px 2px; display: grid; gap: 8px; }
+  .title { font-size: 16.5px; font-weight: 600; line-height: 1.32; text-wrap: balance; margin: 0; }
+  .meta {
+    font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--muted);
+    display: flex; gap: 12px; flex-wrap: wrap;
+  }
+  .meta a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+  .meta a:hover { border-bottom-color: currentColor; }
+  .lead { margin: 0; font-size: 14.5px; color: var(--muted); line-height: 1.5; max-width: 62ch; }
+
+  .btns { display: flex; gap: 6px; margin-top: 2px; flex-wrap: wrap; }
+  .btns button {
+    font-family: "Golos Text", sans-serif; font-size: 14px; font-weight: 500;
+    padding: 7px 16px; border-radius: 3px; cursor: pointer;
+    background: var(--raised); color: var(--ink); border: 1px solid var(--hair);
+    transition: background .12s ease, border-color .12s ease, color .12s ease;
+  }
+  .btns button:hover { border-color: var(--muted); }
+  .btns button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .card[data-v="+"] .b-plus { background: var(--plus); border-color: var(--plus); color: #fff; }
+  .card[data-v="-"] .b-minus { background: var(--minus); border-color: var(--minus); color: #fff; }
+  .card[data-v="0"] .b-skip { background: var(--skip); border-color: var(--skip); color: #fff; }
+
+  .result { max-width: 840px; margin: 0 auto 60px; padding: 0 20px; }
+  .result-in {
+    background: var(--surface); border: 1px solid var(--hair); border-radius: 4px;
+    padding: 18px; display: grid; gap: 12px; box-shadow: var(--shadow);
+  }
+  .result h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  .result p { margin: 0; color: var(--muted); font-size: 14px; }
+  textarea {
+    width: 100%; min-height: 84px; resize: vertical;
+    font-family: "JetBrains Mono", monospace; font-size: 13px; line-height: 1.6;
+    background: var(--raised); color: var(--ink);
+    border: 1px solid var(--hair); border-radius: 3px; padding: 12px;
+  }
+  textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .actions button {
+    font-family: "Golos Text", sans-serif; font-size: 14px; font-weight: 500;
+    padding: 8px 18px; border-radius: 3px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+  }
+  .actions .ghost { background: transparent; color: var(--muted); border-color: var(--hair); }
+  .actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .said { color: var(--plus); font-size: 13px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; scroll-behavior: auto !important; }
+  }
+  @media (max-width: 640px) {
+    .card { grid-template-columns: 34px 1fr; }
+    .num { padding-left: 10px; }
+    .tally { width: 100%; margin-left: 0; }
+  }
+</style>
+
+<header class="bar">
+  <div class="bar-in">
+    <div class="brand">Картотека дайджеста <span>· порция __RANGE__ из __TOTAL__</span></div>
+    <div class="tally">
+      <span class="t-plus">оставить <b id="c-plus">0</b></span>
+      <span class="t-minus">мимо <b id="c-minus">0</b></span>
+      <span class="t-skip">не уверен <b id="c-skip">0</b></span>
+      <span><i>готово</i> <b id="c-done">0</b><i>/<span id="c-all">0</span></i></span>
+    </div>
+  </div>
+  <div class="track"><div class="fill" id="fill"></div></div>
+</header>
+
+<p class="hint">
+  Половину этих новостей бот прислал, половину забраковал — но какая где, здесь не показано специально.
+  С клавиатуры быстрее: <kbd>1</kbd> оставить · <kbd>2</kbd> мимо · <kbd>3</kbd> не уверен · <kbd>J</kbd>/<kbd>K</kbd> двигаться.
+</p>
+
+<main id="list"></main>
+
+<section class="result">
+  <div class="result-in">
+    <h2>Результат</h2>
+    <p>Скопируй и пришли в чат — по этим оценкам меряем, попадает ли отбор в твой вкус.</p>
+    <textarea id="out" readonly></textarea>
+    <div class="actions">
+      <button id="copy">Скопировать</button>
+      <button class="ghost" id="reset">Сбросить</button>
+      <span class="said" id="said"></span>
+    </div>
+  </div>
+</section>
+
+<script>
+  const DATA = __DATA__;
+  const KEY = "kartoteka-" + (DATA[0] ? DATA[0].n : 0);
+  let votes = {};
+  let current = DATA.length ? DATA[0].n : 1;
+
+  try { votes = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { votes = {}; }
+
+  const list = document.getElementById("list");
+  const out = document.getElementById("out");
+  document.getElementById("c-all").textContent = DATA.length;
+
+  DATA.forEach(item => {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.id = "card-" + item.n;
+    if (votes[item.n]) card.dataset.v = votes[item.n];
+
+    const num = document.createElement("div");
+    num.className = "num";
+    num.textContent = String(item.n).padStart(2, "0");
+
+    const body = document.createElement("div");
+    body.className = "body";
+
+    const h = document.createElement("h3");
+    h.className = "title";
+    h.textContent = item.title;
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const date = document.createElement("span");
+    date.textContent = item.date || "—";
+    const a = document.createElement("a");
+    a.href = item.link; a.target = "_blank"; a.rel = "noopener";
+    a.textContent = "открыть статью";
+    meta.append(date, a);
+
+    const lead = document.createElement("p");
+    lead.className = "lead";
+    lead.textContent = item.text;
+
+    const btns = document.createElement("div");
+    btns.className = "btns";
+    [["+", "Оставить", "b-plus"], ["-", "Мимо", "b-minus"], ["0", "Не уверен", "b-skip"]]
+      .forEach(([v, label, cls]) => {
+        const b = document.createElement("button");
+        b.className = cls;
+        b.textContent = label;
+        b.addEventListener("click", () => vote(item.n, v));
+        btns.append(b);
+      });
+
+    body.append(h, meta, lead, btns);
+    card.append(num, body);
+    list.append(card);
+  });
+
+  function vote(n, v) {
+    if (votes[n] === v) delete votes[n]; else votes[n] = v;
+    const card = document.getElementById("card-" + n);
+    if (votes[n]) card.dataset.v = votes[n]; else delete card.dataset.v;
+    save();
+    refresh();
+    const next = DATA.find(d => d.n > n && !votes[d.n]);
+    if (next) focusCard(next.n, true);
+  }
+
+  function focusCard(n, scroll) {
+    document.querySelectorAll(".card.current").forEach(c => c.classList.remove("current"));
+    const card = document.getElementById("card-" + n);
+    if (!card) return;
+    card.classList.add("current");
+    current = n;
+    if (scroll) card.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(votes)); } catch (e) { /* не критично */ }
+  }
+
+  function refresh() {
+    const pick = v => DATA.filter(d => votes[d.n] === v).map(d => d.n);
+    const plus = pick("+"), minus = pick("-"), skip = pick("0");
+    const done = plus.length + minus.length + skip.length;
+
+    document.getElementById("c-plus").textContent = plus.length;
+    document.getElementById("c-minus").textContent = minus.length;
+    document.getElementById("c-skip").textContent = skip.length;
+    document.getElementById("c-done").textContent = done;
+    document.getElementById("fill").style.width = (done / DATA.length * 100) + "%";
+
+    const left = DATA.length - done;
+    out.value =
+      "+ " + (plus.join(",") || "—") + "\n" +
+      "- " + (minus.join(",") || "—") + "\n" +
+      "0 " + (skip.join(",") || "—") +
+      (left ? "\n\n(не размечено: " + left + ")" : "");
+  }
+
+  document.addEventListener("keydown", e => {
+    if (e.target.tagName === "TEXTAREA" || e.metaKey || e.ctrlKey) return;
+    const k = e.key.toLowerCase();
+    const idx = DATA.findIndex(d => d.n === current);
+    if (k === "1") { vote(current, "+"); e.preventDefault(); }
+    else if (k === "2") { vote(current, "-"); e.preventDefault(); }
+    else if (k === "3") { vote(current, "0"); e.preventDefault(); }
+    else if (k === "j" || k === "arrowdown") {
+      if (idx < DATA.length - 1) focusCard(DATA[idx + 1].n, true);
+      e.preventDefault();
+    } else if (k === "k" || k === "arrowup") {
+      if (idx > 0) focusCard(DATA[idx - 1].n, true);
+      e.preventDefault();
+    }
+  });
+
+  document.getElementById("copy").addEventListener("click", async () => {
+    const said = document.getElementById("said");
+    try {
+      await navigator.clipboard.writeText(out.value);
+      said.textContent = "Скопировано";
+    } catch (e) {
+      out.focus(); out.select();
+      said.textContent = "Нажми Cmd+C — текст выделен";
+    }
+    setTimeout(() => { said.textContent = ""; }, 2500);
+  });
+
+  document.getElementById("reset").addEventListener("click", () => {
+    votes = {};
+    document.querySelectorAll(".card").forEach(c => delete c.dataset.v);
+    save(); refresh();
+    if (DATA.length) focusCard(DATA[0].n, true);
+  });
+
+  const first = DATA.find(d => !votes[d.n]);
+  focusCard(first ? first.n : current, false);
+  refresh();
+</script>
